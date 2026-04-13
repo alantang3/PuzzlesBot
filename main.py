@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 from discord import Intents, Message, TextChannel
 from discord.ext import commands
 from discord.ui import View, Select, Button
-from responses import get_response
 import random
 import asyncio
 
@@ -16,7 +15,6 @@ intents: Intents = Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Track active RPS games: thread_id -> game state
 active_rps_games = {}
 
 
@@ -26,19 +24,16 @@ async def send_message(message: Message, user_message: str) -> None:
         return
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Game Mode / Game Selection UI
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Game Mode Select ──────────────────────────────────────────────────────────
 
 class GameModeSelectView(View):
     def __init__(self):
         super().__init__()
-        self.add_item(GameModeSelect(self))
+        self.add_item(GameModeSelect())
 
 
 class GameModeSelect(Select):
-    def __init__(self, parent_view):
-        self.parent_view = parent_view
+    def __init__(self):
         self.has_selected = False
         options = [
             discord.SelectOption(label="Single Player", description="Play alone"),
@@ -49,21 +44,22 @@ class GameModeSelect(Select):
     async def callback(self, interaction: discord.Interaction):
         if self.has_selected:
             await interaction.response.send_message(
-                "You have already selected a game mode. Please restart the command to choose a new game mode",
+                "You have already selected a game mode. Please restart the command to choose a new game mode.",
                 ephemeral=True)
             return
         self.has_selected = True
         mode = self.values[0]
         await interaction.response.send_message(
-            f"Game mode set to {mode}. Now choose a game to play:",
+            f"Game mode set to **{mode}**. Now choose a game to play:",
             view=GameSelectView(mode),
             ephemeral=True)
 
 
+# ── Game Select ───────────────────────────────────────────────────────────────
+
 class GameSelectView(View):
     def __init__(self, mode: str):
         super().__init__()
-        self.mode = mode
         self.add_item(GameSelect(mode))
 
 
@@ -81,51 +77,57 @@ class GameSelect(Select):
             discord.SelectOption(label="Hangman", description="Guess the word."),
             discord.SelectOption(label="Who Sent the Message?", description="Guess the message sender."),
             discord.SelectOption(label="Guess the Number!", description="Guess the number."),
-            discord.SelectOption(label="Rock Paper Scissors", description="Play Rock Paper Scissors.")
+            discord.SelectOption(label="Rock Paper Scissors", description="Play Rock Paper Scissors."),
         ]
         super().__init__(placeholder="Choose a game to play...", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         if self.has_selected:
             await interaction.response.send_message(
-                "You have already selected a game. Please restart the command to choose a new game",
+                "You have already selected a game. Please restart the command to choose a new game.",
                 ephemeral=True)
+            return
+
+        if not isinstance(interaction.channel, TextChannel):
+            await interaction.response.send_message(
+                "This command must be used in a regular text channel.", ephemeral=True)
             return
 
         self.has_selected = True
         selected_game = self.values[0]
 
-        if isinstance(interaction.channel, TextChannel):
-            thread = await interaction.channel.create_thread(
-                name=f"{interaction.user.name}'s {selected_game} Lobby",
-                type=discord.ChannelType.private_thread,
-                invitable=True)
-            await thread.add_user(interaction.user)
+        # Defer immediately so Discord doesn't time out while we create the thread
+        await interaction.response.defer(ephemeral=True)
 
-            if self.mode == "Single Player":
-                await thread.send(
-                    f"{interaction.user.mention}, Welcome to your private game lobby! Type `!start` to begin!")
-            else:
-                await thread.send(
-                    f"{interaction.user.mention}, Welcome to your private game lobby! "
-                    f"Ping your friends to join, then type `!start` to begin!")
+        thread = await interaction.channel.create_thread(
+            name=f"{interaction.user.name}'s {selected_game} Lobby",
+            type=discord.ChannelType.private_thread,
+            invitable=True)
+        await thread.add_user(interaction.user)
 
-            async def delete_thread_after_delay():
-                await asyncio.sleep(1200)
-                try:
-                    await thread.delete()
-                except Exception:
-                    pass
-
-            asyncio.create_task(delete_thread_after_delay())
+        if self.mode == "Single Player":
+            await thread.send(
+                f"{interaction.user.mention}, welcome to your private game lobby! "
+                f"Type `!start` to begin.")
         else:
-            await interaction.response.send_message(
-                "This command must be used in a regular text channel.", ephemeral=True)
+            await thread.send(
+                f"{interaction.user.mention}, welcome to your private game lobby! "
+                f"Ping your friends to join, then type `!start` to begin.")
+
+        await interaction.followup.send(
+            f"Your lobby is ready! Head to {thread.mention}.", ephemeral=True)
+
+        async def delete_thread_after_delay():
+            await asyncio.sleep(1200)
+            try:
+                await thread.delete()
+            except Exception:
+                pass
+
+        asyncio.create_task(delete_thread_after_delay())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Rock Paper Scissors Logic
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Rock Paper Scissors ───────────────────────────────────────────────────────
 
 CHOICES = ["Rock", "Paper", "Scissors"]
 EMOJI = {"Rock": "🪨", "Paper": "📄", "Scissors": "✂️"}
@@ -138,8 +140,62 @@ def rps_outcome(a: str, b: str) -> str:
     return "a" if BEATS[a] == b else "b"
 
 
+class RPSLobbyView(View):
+    """Lobby: friends click Join, then host clicks Start."""
+
+    def __init__(self, host: discord.Member, thread_id: int):
+        super().__init__(timeout=300)
+        self.host = host
+        self.thread_id = thread_id
+        self.players: list[discord.Member] = [host]
+        self.started = False
+
+    @discord.ui.button(label="Join Game", style=discord.ButtonStyle.success, emoji="✋")
+    async def join(self, interaction: discord.Interaction, button: Button):
+        if self.started:
+            await interaction.response.send_message("The game has already started!", ephemeral=True)
+            return
+        if any(p.id == interaction.user.id for p in self.players):
+            await interaction.response.send_message("You're already in the lobby!", ephemeral=True)
+            return
+        self.players.append(interaction.user)
+        names = ", ".join(f"**{p.display_name}**" for p in self.players)
+        await interaction.response.send_message(
+            f"{interaction.user.mention} joined! Players: {names}")
+
+    @discord.ui.button(label="Start Game", style=discord.ButtonStyle.primary, emoji="▶️")
+    async def start(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.host.id:
+            await interaction.response.send_message("Only the host can start the game!", ephemeral=True)
+            return
+        if self.started:
+            await interaction.response.send_message("Game already started!", ephemeral=True)
+            return
+        self.started = True
+        self.stop()
+
+        if len(self.players) == 1:
+            player = self.players[0]
+            view = RPSSingleView(player)
+            await interaction.response.edit_message(
+                content=f"🪨📄✂️ **Rock Paper Scissors** — {player.mention} vs the Bot!\nMake your pick:",
+                view=view)
+        else:
+            view = RPSMultiView(list(self.players), self.thread_id)
+            mentions = " ".join(p.mention for p in self.players)
+            await interaction.response.edit_message(
+                content=f"🪨📄✂️ **Rock Paper Scissors** — {mentions}\n"
+                        f"Each player: click your choice (only you can see your pick):",
+                view=view)
+
+    async def on_timeout(self):
+        self.stop()
+        if self.thread_id in active_rps_games:
+            del active_rps_games[self.thread_id]
+
+
 class RPSSingleView(View):
-    """Single player: author vs bot."""
+    """Single player vs bot."""
 
     def __init__(self, player: discord.Member):
         super().__init__(timeout=60)
@@ -189,59 +245,8 @@ class RPSSingleView(View):
         self.stop()
 
 
-class RPSLobbyView(View):
-    """Multiplayer lobby: players click Join, then host clicks Start."""
-
-    def __init__(self, host: discord.Member, thread_id: int):
-        super().__init__(timeout=300)
-        self.host = host
-        self.thread_id = thread_id
-        self.players: list[discord.Member] = [host]
-        self.started = False
-
-    @discord.ui.button(label="Join Game", style=discord.ButtonStyle.success, emoji="✋")
-    async def join(self, interaction: discord.Interaction, button: Button):
-        if self.started:
-            await interaction.response.send_message("The game has already started!", ephemeral=True)
-            return
-        member = interaction.user
-        if any(p.id == member.id for p in self.players):
-            await interaction.response.send_message("You're already in the lobby!", ephemeral=True)
-            return
-        self.players.append(member)
-        names = ", ".join(f"**{p.display_name}**" for p in self.players)
-        await interaction.response.send_message(
-            f"{member.mention} joined! Players in lobby: {names}", ephemeral=False)
-
-    @discord.ui.button(label="Start Game", style=discord.ButtonStyle.primary, emoji="▶️")
-    async def start(self, interaction: discord.Interaction, button: Button):
-        if interaction.user.id != self.host.id:
-            await interaction.response.send_message(
-                "Only the host can start the game!", ephemeral=True)
-            return
-        if self.started:
-            await interaction.response.send_message("Game already started!", ephemeral=True)
-            return
-        self.started = True
-        self.stop()
-
-        if len(self.players) == 1:
-            # Solo vs bot
-            player = self.players[0]
-            view = RPSSingleView(player)
-            await interaction.response.edit_message(
-                content=f"🪨📄✂️ **Rock Paper Scissors** — {player.mention} vs the Bot!\nMake your pick:",
-                view=view)
-        else:
-            view = RPSMultiView(list(self.players), self.thread_id)
-            mentions = " ".join(p.mention for p in self.players)
-            await interaction.response.edit_message(
-                content=f"🪨📄✂️ **Rock Paper Scissors** — {mentions}\nEach player: click your choice (only you can see your pick):",
-                view=view)
-
-
 class RPSMultiView(View):
-    """Multiplayer picks — each player picks secretly via ephemeral response."""
+    """Multiplayer — each player picks secretly."""
 
     def __init__(self, players: list[discord.Member], thread_id: int):
         super().__init__(timeout=120)
@@ -283,8 +288,7 @@ class RPSMultiView(View):
 
         if len(player_list) == 2:
             p1, p2 = player_list
-            c1, c2 = self.choices[p1.id], self.choices[p2.id]
-            result = rps_outcome(c1, c2)
+            result = rps_outcome(self.choices[p1.id], self.choices[p2.id])
             if result == "tie":
                 lines.append("🤝 It's a **tie**!")
             elif result == "a":
@@ -292,15 +296,13 @@ class RPSMultiView(View):
             else:
                 lines.append(f"🎉 **{p2.display_name}** wins!")
         else:
-            unique_choices = set(self.choices.values())
-            if len(unique_choices) == 1 or len(unique_choices) == 3:
+            unique = set(self.choices.values())
+            if len(unique) == 1 or len(unique) == 3:
                 lines.append("🤝 It's a **tie** — everyone cancels out!")
             else:
-                winning_choice = None
-                for c in unique_choices:
-                    if all(rps_outcome(c, other) != "b" for other in unique_choices if other != c):
-                        winning_choice = c
-                        break
+                winning_choice = next(
+                    (c for c in unique if all(rps_outcome(c, o) != "b" for o in unique if o != c)),
+                    None)
                 if winning_choice:
                     winners = [self.players[uid].display_name
                                for uid, ch in self.choices.items() if ch == winning_choice]
@@ -338,9 +340,7 @@ class RPSMultiView(View):
                 f"Type `!start` to try again.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# !start command
-# ─────────────────────────────────────────────────────────────────────────────
+# ── !start command ────────────────────────────────────────────────────────────
 
 @bot.command(name="start")
 async def start_game(ctx: commands.Context):
@@ -350,37 +350,24 @@ async def start_game(ctx: commands.Context):
         return
 
     if "Rock Paper Scissors" in channel.name:
-        await _start_rps(ctx, channel)
+        if channel.id in active_rps_games:
+            await ctx.send("A game is already in progress! Finish it first or wait for it to time out.")
+            return
+        active_rps_games[channel.id] = True
+        host = ctx.author
+        view = RPSLobbyView(host, channel.id)
+        await ctx.send(
+            f"🪨📄✂️ **Rock Paper Scissors Lobby**\n"
+            f"{host.mention} is the host.\n"
+            f"Friends: click **Join Game** to enter.\n"
+            f"Host: click **Start Game** when everyone's ready.\n"
+            f"*(Solo vs bot? Just click Start Game now!)*",
+            view=view)
     else:
         await ctx.send("This game hasn't been implemented yet. Stay tuned!")
 
 
-async def _start_rps(ctx: commands.Context, thread: discord.Thread):
-    if thread.id in active_rps_games:
-        await ctx.send("A game is already in progress! Finish it first or wait for it to time out.")
-        return
-
-    host = ctx.author
-    active_rps_games[thread.id] = True
-
-    if "Multiplayer" in thread.name or True:
-        # For multiplayer threads, show a lobby so players can join
-        # We determine single vs multi by whether it says "Single Player" — but since
-        # thread names don't include the mode, we use a lobby view and let the host
-        # decide when to start (works for both 1v1 and solo vs bot if only 1 player joins).
-        view = RPSLobbyView(host, thread.id)
-        await ctx.send(
-            f"🪨📄✂️ **Rock Paper Scissors Lobby**\n"
-            f"{host.mention} is the host. Others: click **Join Game** to enter.\n"
-            f"When everyone's in, {host.mention} clicks **Start Game**.\n"
-            f"*(If you're playing solo vs the bot, just click Start Game now!)*",
-            view=view
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Slash command: /game
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Slash command: /game ──────────────────────────────────────────────────────
 
 @bot.tree.command(name="game",
                   description="Start a game",
@@ -391,9 +378,7 @@ async def game(interaction: discord.Interaction):
                                             ephemeral=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bot events
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Bot events ────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready() -> None:
@@ -428,9 +413,7 @@ async def on_message(message: Message) -> None:
     await bot.process_commands(message)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     bot.run(token=TOKEN)
