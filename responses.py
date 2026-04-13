@@ -1,4 +1,4 @@
 from random import choice, randint
 
-def get_response(unser_input: str) -> str:
-  l
+def get_response(user_input: str) -> str:
+  return f"You said: {message}"
