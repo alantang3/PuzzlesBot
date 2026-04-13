@@ -10,7 +10,7 @@ import random
 import asyncio
 
 load_dotenv()
-TOKEN: Final[str] = os.getenv('DISCORD_TOKEN')
+TOKEN: Final[str] = os.getenv("DISCORD_TOKEN")
 
 intents: Intents = Intents.default()
 intents.message_content = True
@@ -22,7 +22,7 @@ active_rps_games = {}
 
 async def send_message(message: Message, user_message: str) -> None:
     if not user_message:
-        print('(Message was empty because intents were not enabled')
+        print("(Message was empty because intents were not enabled")
         return
 
 
@@ -30,15 +30,14 @@ async def send_message(message: Message, user_message: str) -> None:
 # Game Mode / Game Selection UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-class GameModeSelectView(View):
 
+class GameModeSelectView(View):
     def __init__(self):
         super().__init__()
         self.add_item(GameModeSelect(self))
 
 
 class GameModeSelect(Select):
-
     def __init__(self, parent_view: GameModeSelectView):
         self.parent_view = parent_view
         self.has_selected = False
@@ -58,18 +57,19 @@ class GameModeSelect(Select):
         if self.has_selected:
             await interaction.response.send_message(
                 "You have already selected a game mode. Please restart the command to choose a new game mode",
-                ephemeral=True)
+                ephemeral=True,
+            )
             return
         self.has_selected = True
         mode = self.values[0]
         await interaction.response.send_message(
             f"Game mode set to {mode}. Now choose a game to play:",
             view=GameSelectView(mode),
-            ephemeral=True)
+            ephemeral=True,
+        )
 
 
 class GameSelectView(View):
-
     def __init__(self, mode: str):
         super().__init__()
         self.mode = mode
@@ -77,21 +77,36 @@ class GameSelectView(View):
 
 
 class GameSelect(Select):
-
     def __init__(self, mode: str):
         self.mode = mode
         self.has_selected = False
         options = [
-            discord.SelectOption(label="Cryptograms", description="Decode the cryptograms."),
+            discord.SelectOption(
+                label="Cryptograms", description="Decode the cryptograms."
+            ),
             discord.SelectOption(label="Wordle", description="Guess the word"),
-            discord.SelectOption(label="Sports Trivia", description="Test your sports knowledge!"),
-            discord.SelectOption(label="Guess the Flag", description="Guess the country flag."),
-            discord.SelectOption(label="Who's That Pokemon?", description="Guess the Pokemon."),
-            discord.SelectOption(label="Higher or Lower?", description="Higher or lower?"),
+            discord.SelectOption(
+                label="Sports Trivia", description="Test your sports knowledge!"
+            ),
+            discord.SelectOption(
+                label="Guess the Flag", description="Guess the country flag."
+            ),
+            discord.SelectOption(
+                label="Who's That Pokemon?", description="Guess the Pokemon."
+            ),
+            discord.SelectOption(
+                label="Higher or Lower?", description="Higher or lower?"
+            ),
             discord.SelectOption(label="Hangman", description="Guess the word."),
-            discord.SelectOption(label="Who Sent the Message?", description="Guess the message sender."),
-            discord.SelectOption(label="Guess the Number!", description="Guess the number."),
-            discord.SelectOption(label="Rock Paper Scissors", description="Play Rock Paper Scissors.")
+            discord.SelectOption(
+                label="Who Sent the Message?", description="Guess the message sender."
+            ),
+            discord.SelectOption(
+                label="Guess the Number!", description="Guess the number."
+            ),
+            discord.SelectOption(
+                label="Rock Paper Scissors", description="Play Rock Paper Scissors."
+            ),
         ]
 
         super().__init__(
@@ -105,7 +120,8 @@ class GameSelect(Select):
         if self.has_selected:
             await interaction.response.send_message(
                 "You have already selected a game. Please restart the command to choose a new game",
-                ephemeral=True)
+                ephemeral=True,
+            )
             return
 
         self.has_selected = True
@@ -116,38 +132,46 @@ class GameSelect(Select):
                 thread = await interaction.channel.create_thread(
                     name=f"{interaction.user.name}'s {selected_game} Lobby",
                     type=discord.ChannelType.private_thread,
-                    invitable=True)
+                    invitable=True,
+                )
                 await thread.add_user(interaction.user)
                 await thread.send(
                     f"{interaction.user.mention}, Welcome to your private game lobby! Type `!start` to begin!"
                 )
+
                 async def delete_thread_after_delay():
                     await asyncio.sleep(1200)
                     await thread.delete()
+
                 asyncio.create_task(delete_thread_after_delay())
             else:
                 await interaction.response.send_message(
                     "This command must be used in a regular text channel.",
-                    ephemeral=True)
+                    ephemeral=True,
+                )
 
         elif self.mode == "Multiplayer":
             if isinstance(interaction.channel, TextChannel):
                 thread = await interaction.channel.create_thread(
                     name=f"{interaction.user.name}'s {selected_game} Lobby",
                     type=discord.ChannelType.private_thread,
-                    invitable=True)
+                    invitable=True,
+                )
                 await thread.add_user(interaction.user)
                 await thread.send(
                     f"{interaction.user.mention}, Welcome to your private game lobby! Ping your friends to join. Once everyone's here type `!start` to begin!"
                 )
+
                 async def delete_thread_after_delay():
                     await asyncio.sleep(1200)
                     await thread.delete()
+
                 asyncio.create_task(delete_thread_after_delay())
             else:
                 await interaction.response.send_message(
                     "This command must be used in a regular text channel.",
-                    ephemeral=True)
+                    ephemeral=True,
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,10 +207,14 @@ class RPSSingleView(View):
 
     async def _handle(self, interaction: discord.Interaction, choice: str):
         if interaction.user.id != self.player.id:
-            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            await interaction.response.send_message(
+                "This isn't your game!", ephemeral=True
+            )
             return
         if self.done:
-            await interaction.response.send_message("You already picked!", ephemeral=True)
+            await interaction.response.send_message(
+                "You already picked!", ephemeral=True
+            )
             return
         self.done = True
         self.stop()
@@ -237,10 +265,14 @@ class RPSMultiView(View):
     async def _handle(self, interaction: discord.Interaction, choice: str):
         uid = interaction.user.id
         if uid not in self.players:
-            await interaction.response.send_message("You're not part of this game!", ephemeral=True)
+            await interaction.response.send_message(
+                "You're not part of this game!", ephemeral=True
+            )
             return
         if uid in self.choices:
-            await interaction.response.send_message("You already made your pick!", ephemeral=True)
+            await interaction.response.send_message(
+                "You already made your pick!", ephemeral=True
+            )
             return
 
         self.choices[uid] = choice
@@ -248,7 +280,7 @@ class RPSMultiView(View):
         await interaction.response.send_message(
             f"Got it! You chose {EMOJI[choice]} **{choice}**. "
             + (f"Waiting for {remaining} more player(s)..." if remaining else ""),
-            ephemeral=True
+            ephemeral=True,
         )
 
         if len(self.choices) == len(self.players):
@@ -287,12 +319,22 @@ class RPSMultiView(View):
             else:
                 winning_choice = None
                 for c in unique_choices:
-                    if all(rps_outcome(c, other) != "b" for other in unique_choices if other != c):
+                    if all(
+                        rps_outcome(c, other) != "b"
+                        for other in unique_choices
+                        if other != c
+                    ):
                         winning_choice = c
                         break
                 if winning_choice:
-                    winners = [self.players[uid].display_name for uid, ch in self.choices.items() if ch == winning_choice]
-                    lines.append(f"🎉 **{', '.join(winners)}** win with {EMOJI[winning_choice]} {winning_choice}!")
+                    winners = [
+                        self.players[uid].display_name
+                        for uid, ch in self.choices.items()
+                        if ch == winning_choice
+                    ]
+                    lines.append(
+                        f"🎉 **{', '.join(winners)}** win with {EMOJI[winning_choice]} {winning_choice}!"
+                    )
                 else:
                     lines.append("🤝 It's a **tie**!")
 
@@ -319,13 +361,20 @@ class RPSMultiView(View):
         thread = bot.get_channel(self.thread_id)
         if thread and self.thread_id in active_rps_games:
             del active_rps_games[self.thread_id]
-            missing = [self.players[uid].display_name for uid in self.players if uid not in self.choices]
-            await thread.send(f"⏰ Game timed out. The following players didn't pick in time: **{', '.join(missing)}**.\nType `!start` to try again.")
+            missing = [
+                self.players[uid].display_name
+                for uid in self.players
+                if uid not in self.choices
+            ]
+            await thread.send(
+                f"⏰ Game timed out. The following players didn't pick in time: **{', '.join(missing)}**.\nType `!start` to try again."
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # !start command
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @bot.command(name="start")
 async def start_game(ctx: commands.Context):
@@ -349,7 +398,9 @@ async def _start_rps(ctx: commands.Context, thread: discord.Thread, thread_name:
     """Start a Rock Paper Scissors game in the given thread."""
 
     if thread.id in active_rps_games:
-        await ctx.send("A game is already in progress! Finish it first or wait for it to time out.")
+        await ctx.send(
+            "A game is already in progress! Finish it first or wait for it to time out."
+        )
         return
 
     # Detect mode by player count — 1 human = vs bot, multiple = multiplayer
@@ -372,16 +423,19 @@ async def _start_rps(ctx: commands.Context, thread: discord.Thread, thread_name:
         view = RPSSingleView(player)
         await ctx.send(
             f"🪨📄✂️ **Rock Paper Scissors** — {player.mention} vs the Bot!\nMake your pick:",
-            view=view
+            view=view,
         )
     else:
         # Multiplayer
-        active_rps_games[thread.id] = {"mode": "multi", "players": [m.id for m in human_members]}
+        active_rps_games[thread.id] = {
+            "mode": "multi",
+            "players": [m.id for m in human_members],
+        }
         view = RPSMultiView(human_members, thread.id)
         mentions = " ".join(m.mention for m in human_members)
         await ctx.send(
             f"🪨📄✂️ **Rock Paper Scissors** — {mentions}\nEach player: click your choice (only you can see your pick):",
-            view=view
+            view=view,
         )
 
 
@@ -389,25 +443,29 @@ async def _start_rps(ctx: commands.Context, thread: discord.Thread, thread_name:
 # Slash command: /game
 # ─────────────────────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="game",
-                  description="Start a game",
-                  guild=discord.Object(id=1353035066082721896))
+
+@bot.tree.command(
+    name="game",
+    description="Start a game",
+    guild=discord.Object(id=1353035066082721896),
+)
 async def game(interaction: discord.Interaction):
-    await interaction.response.send_message("Choose a gamemode:",
-                                            view=GameModeSelectView(),
-                                            ephemeral=True)
+    await interaction.response.send_message(
+        "Choose a gamemode:", view=GameModeSelectView(), ephemeral=True
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bot events
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @bot.event
 async def on_ready() -> None:
     await bot.wait_until_ready()
     test_guild = discord.Object(id=1353035066082721896)
     await bot.tree.sync(guild=test_guild)
-    print(f'{bot.user} is now running!')
+    print(f"{bot.user} is now running!")
 
 
 @bot.event
@@ -425,12 +483,16 @@ async def on_message(message: Message) -> None:
 
     if message.content.strip():
         temp = message.content.lower()
-        if temp.startswith('i\'m '):
+        if temp.startswith("i'm "):
             pick = random.randint(1, 2)
             if pick == 1:
-                await message.channel.send('Hi ' + message.content[4::] + ', I\'m Alan Tang, the goat')
+                await message.channel.send(
+                    "Hi " + message.content[4::] + ", I'm Alan Tang, the goat"
+                )
             if pick == 2:
-                await message.channel.send('Hi ' + message.content[4::] + ', I\'m David Tan, the fraud')
+                await message.channel.send(
+                    "Hi " + message.content[4::] + ", I'm David Tan, the fraud"
+                )
 
     await bot.process_commands(message)
 
@@ -439,9 +501,10 @@ async def on_message(message: Message) -> None:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     bot.run(token=TOKEN)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
