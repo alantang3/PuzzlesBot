@@ -1,222 +1,248 @@
-from typing import Final
-import os
-import discord
-from dotenv import load_dotenv
-from discord import Intents, Client, Message, TextChannel, app_commands, ChannelType
-from discord.ext import commands
-from discord.ui import View, Select
-from responses import get_response
-import random
 import asyncio
-#Load token 
-load_dotenv()
-TOKEN: Final[str] = os.getenv('DISCORD_TOKEN')
+import os
+import random
+import time
+from pathlib import Path
+from typing import Final
 
-#Bot setup
+import discord
+from discord import Intents, Message, TextChannel
+from discord.ext import commands, tasks
+from discord.ui import Select, View
+from dotenv import load_dotenv
+
+from games import GAMES, start_game
+
+load_dotenv()
+TOKEN: Final[str] = os.getenv("DISCORD_TOKEN")
+GUILD_ID: Final[int] = 1353035066082721896
+LOBBY_TTL = 1200  # auto-delete lobby thread after this many seconds
+TRENDS_REFRESH_HOURS = 12
+TRENDS_DATA_PATH = Path(__file__).resolve().parent / "games" / "data" / "trends.json"
+
 intents: Intents = Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-
-#Message functionality
-async def send_message(message: Message, user_message: str) -> None:
-  if not user_message:
-    print('(Message was empty because intents were not enabled')
-    return
+# thread_id -> {"game": str, "mode": str, "host": int, "started": bool}
+active_lobbies: dict[int, dict] = {}
 
 
-#Dropdown menu
 class GameModeSelectView(View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(GameModeSelect())
 
-  def __init__(self):
-    super().__init__()
-    self.add_item(GameModeSelect(self))
 
-
-#Choose game mode
 class GameModeSelect(Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Single Player", description="Play alone"),
+            discord.SelectOption(label="Multiplayer", description="Play with friends"),
+        ]
+        super().__init__(
+            placeholder="Choose a game mode...",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
 
-  def __init__(self, parent_view: GameModeSelectView):
-    self.parent_view = parent_view
-    self.has_selected = False
-    options = [
-        discord.SelectOption(label="Single Player", description="Play alone"),
-        discord.SelectOption(label="Multiplayer",
-                             description="Play with friends"),
-    ]
-
-    super().__init__(
-        placeholder="Choose a game mode...",
-        options=options,
-        min_values=1,
-        max_values=1,
-    )
-
-  async def callback(self, interaction: discord.Interaction):
-    if self.has_selected:
-      await interaction.response.send_message(
-          "You have already selected a game mode. Please restart the command to choose a new game mode",
-          ephemeral=True)
-      return
-    self.has_selected = True
-    mode = self.values[0]
-    await interaction.response.send_message(
-        f"Game mode set to {mode}. Now choose a game to play:",
-        view=GameSelectView(mode),
-        ephemeral=True)
+    async def callback(self, interaction: discord.Interaction):
+        mode = self.values[0]
+        await interaction.response.send_message(
+            f"Game mode set to **{mode}**. Now choose a game:",
+            view=GameSelectView(mode),
+            ephemeral=True,
+        )
 
 
 class GameSelectView(View):
-
-  def __init__(self, mode: str):
-    super().__init__()
-    self.mode = mode
-    self.add_item(GameSelect(mode))
+    def __init__(self, mode: str):
+        super().__init__(timeout=120)
+        self.add_item(GameSelect(mode))
 
 
-#Choose game
 class GameSelect(Select):
+    def __init__(self, mode: str):
+        self.mode = mode
+        implemented = set(GAMES.keys())
+        options = [
+            discord.SelectOption(label="Guess the Number!", description="Guess the number."),
+            discord.SelectOption(label="Higher or Lower?", description="Higher or lower?"),
+            discord.SelectOption(label="Rock Paper Scissors", description="Play Rock Paper Scissors."),
+            discord.SelectOption(label="Hangman", description="Guess the word."),
+            discord.SelectOption(label="Cryptograms", description="Decode the cryptograms. (coming soon)"),
+            discord.SelectOption(label="Wordle", description="Guess the word. (coming soon)"),
+            discord.SelectOption(label="Sports Trivia", description="Test your sports knowledge! (coming soon)"),
+            discord.SelectOption(label="Guess the Flag", description="Guess the country flag. (coming soon)"),
+            discord.SelectOption(label="Who's That Pokemon?", description="Guess the Pokemon. (coming soon)"),
+            discord.SelectOption(label="Who Sent the Message?", description="Guess the message sender. (coming soon)"),
+        ]
+        super().__init__(
+            placeholder="Choose a game to play...",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+        self._implemented = implemented
 
-  def __init__(self, mode: str):
-    self.mode = mode
-    self.has_selected = False
-    options = [
-        discord.SelectOption(label="Cryptograms",
-                             description="Decode the cryptograms."),
-        discord.SelectOption(label="Wordle", description="Guess the word"),
-        discord.SelectOption(label="Sports Trivia",
-                             description="Test your sports knowledge!"),
-        discord.SelectOption(label="Guess the Flag",
-                             description="Guess the country flag."),
-        discord.SelectOption(label="Who's That Pokemon?",
-                             description="Guess the Pokemon."),
-        discord.SelectOption(label="Higher or Lower?",
-                             description="Higher or lower?"),
-        discord.SelectOption(label="Hangman", description="Guess the word."),
-        discord.SelectOption(label="Who Sent the Message?",
-                             description="Guess the message sender."),
-        discord.SelectOption(label="Guess the Number!",
-                             description="Guess the number."),
-        discord.SelectOption(label="Rock Paper Scissors",
-                             description="Play Rock Paper Scissors.")
-    ]
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values[0]
+        if selected not in self._implemented:
+            await interaction.response.send_message(
+                f"**{selected}** isn't ready yet — try one of the games without a *(coming soon)* tag.",
+                ephemeral=True,
+            )
+            return
 
-    super().__init__(
-        placeholder="Choose a game to play...",
-        options=options,
-        min_values=1,
-        max_values=1,
+        if not isinstance(interaction.channel, TextChannel):
+            await interaction.response.send_message(
+                "This command must be used in a regular text channel.",
+                ephemeral=True,
+            )
+            return
+
+        thread = await interaction.channel.create_thread(
+            name=f"{interaction.user.name}'s {selected} Lobby",
+            type=discord.ChannelType.private_thread,
+            invitable=True,
+        )
+        await thread.add_user(interaction.user)
+
+        if self.mode == "Single Player":
+            intro = (
+                f"{interaction.user.mention}, welcome to your private game lobby! "
+                f"Type `!start` to begin **{selected}**."
+            )
+        else:
+            intro = (
+                f"{interaction.user.mention}, welcome to your private game lobby! "
+                f"Ping your friends to join. Once everyone's here, type `!start` to begin **{selected}**.\n"
+                f"_(Note: multiplayer support is being added — for now the game will run as single player.)_"
+            )
+
+        await thread.send(intro)
+        active_lobbies[thread.id] = {
+            "game": selected,
+            "mode": self.mode,
+            "host": interaction.user.id,
+            "started": False,
+        }
+        await interaction.response.send_message(
+            f"Lobby created: {thread.mention}", ephemeral=True
+        )
+
+        async def cleanup():
+            await asyncio.sleep(LOBBY_TTL)
+            active_lobbies.pop(thread.id, None)
+            try:
+                await thread.delete()
+            except discord.HTTPException:
+                pass
+
+        asyncio.create_task(cleanup())
+
+
+@bot.tree.command(
+    name="game",
+    description="Start a game",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def game(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "Choose a gamemode:",
+        view=GameModeSelectView(),
+        ephemeral=True,
     )
 
-  async def callback(self, interaction: discord.Interaction):
-    if self.has_selected:
-      await interaction.response.send_message(
-          "You have already selected a game. Please restart the command to choose a new game",
-          ephemeral=True)
-      return
 
-    self.has_selected = True
-    selected_game = self.values[0]
-      
-    if self.mode == "Single Player":
-      if isinstance(interaction.channel, TextChannel):
-        #Create private threaad
-        thread = await interaction.channel.create_thread(
-            name=f"{interaction.user.name}'s {selected_game} Lobby",
-            type=discord.ChannelType.private_thread,
-            invitable=True)
-        await thread.add_user(interaction.user)
-        await thread.send(
-            f"{interaction.user.mention}, Welcome to your private game lobby! Type '!start' to begin!"
-        )
-        # Schedule deletion after 20 minutes (1200 seconds)
-        async def delete_thread_after_delay():
-          await asyncio.sleep(1200)
-          await thread.delete()
+@bot.command(name="start")
+async def start_cmd(ctx: commands.Context):
+    lobby = active_lobbies.get(ctx.channel.id)
+    if lobby is None:
+        return  # not in a tracked lobby thread; ignore
+    if lobby["started"]:
+        await ctx.send("This game has already started.")
+        return
+    if ctx.author.id != lobby["host"]:
+        await ctx.send("Only the lobby host can start the game.")
+        return
 
-        # Start the deletion task
-        asyncio.create_task(delete_thread_after_delay())
+    lobby["started"] = True
+    await start_game(lobby["game"], ctx.channel, ctx.author, bot)
 
-      else:
-        await interaction.response.send_message(
-            "This command must be used in a regular text channel.",
-            ephemeral=True)
 
-    elif self.mode == "Multiplayer":
-      if isinstance(interaction.channel, TextChannel):
-        #Create private threaad
-        thread = await interaction.channel.create_thread(
-            name=f"{interaction.user.name}'s {selected_game} Lobby",
-            type=discord.ChannelType.private_thread,
-            invitable=True)
-        await thread.add_user(interaction.user)
-        await thread.send(
-            f"{interaction.user.mention}, Welcome to your private game lobby! Ping your friends to join the game. Once everyone's here type '!start' to begin!"
-        )
-        # Schedule deletion after 20 minutes (1200 seconds)
-        async def delete_thread_after_delay():
-          await asyncio.sleep(1200)
-          await thread.delete()
+async def _run_trends_refresh() -> None:
+    """Refresh the Google Trends dataset in a worker thread (pytrends is sync)."""
+    try:
+        from scripts.build_trends_dataset import refresh_trends_dataset
+    except ImportError as e:
+        print(f"[trends] skipped — {e}")
+        return
+    try:
+        count = await asyncio.to_thread(refresh_trends_dataset, False)
+        print(f"[trends] refreshed {count} terms")
+    except ImportError:
+        print("[trends] skipped — pytrends not installed (pip install pytrends)")
+    except Exception as e:
+        print(f"[trends] refresh failed: {e}")
 
-        # Start the deletion task
-        asyncio.create_task(delete_thread_after_delay())
 
+@tasks.loop(hours=TRENDS_REFRESH_HOURS)
+async def refresh_trends_loop() -> None:
+    await _run_trends_refresh()
+
+
+@refresh_trends_loop.before_loop
+async def _before_trends_loop() -> None:
+    await bot.wait_until_ready()
+    # Self-heal stale data on startup: refresh now if the file is older than the interval.
+    try:
+        age_hours = (time.time() - TRENDS_DATA_PATH.stat().st_mtime) / 3600
+    except FileNotFoundError:
+        age_hours = float("inf")
+    if age_hours >= TRENDS_REFRESH_HOURS:
+        print(f"[trends] dataset is {age_hours:.1f}h old — refreshing on startup")
+        await _run_trends_refresh()
     else:
-      await interaction.response.send_message(
-          "This command must be used in a regular text channel.",
-          ephemeral=True)
+        print(f"[trends] dataset is {age_hours:.1f}h old — next refresh in {TRENDS_REFRESH_HOURS}h")
 
 
-#Slash command: /game
-@bot.tree.command(name="game",
-                  description="Start a game",
-                  guild=discord.Object(id=1353035066082721896))
-async def game(interaction: discord.Interaction):
-  await interaction.response.send_message("Choose a gamemode:",
-                                          view=GameModeSelectView(),
-                                          ephemeral=True)
-
-
-#Startup bot
 @bot.event
 async def on_ready() -> None:
-  await bot.wait_until_ready()
-  test_guild = discord.Object(id=1353035066082721896)
-  await bot.tree.sync(guild=test_guild)
-  print(f'{bot.user} is now running!')
+    await bot.wait_until_ready()
+    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    if not refresh_trends_loop.is_running():
+        refresh_trends_loop.start()
+    print(f"{bot.user} is now running!")
 
 
-#Handle incoming message
 @bot.event
 async def on_message(message: Message) -> None:
-  if message.author == bot.user:
-    return
+    if message.author == bot.user:
+        return
 
-  username: str = str(message.author)
-  user_message: str = message.content
-  channel: str = str(message.channel)
+    print(f'[{message.channel}] {message.author}: "{message.content}"')
 
-  print(f'[{channel}] {username}: "{user_message}"')
+    # Run command processing (handles !start).
+    await bot.process_commands(message)
 
-  await send_message(message, user_message)
-
-  if message.content.strip():
-    temp = message.content.lower()
-
-    if temp.startswith('i\'m '):
-      pick = random.randint(1, 2)
-      if pick == 1:
-        await message.channel.send('Hi ' + message.content[4::] +
-                                   ', I\'m Alan Tang, the goat')
-      if pick == 2:
-        await message.channel.send('Hi ' + message.content[4::] +
-                                   ', I\'m David Tan, the fraud')
+    # Easter egg — skip in active game threads so it doesn't interrupt gameplay.
+    if message.channel.id in active_lobbies:
+        return
+    content = message.content.strip().lower()
+    if content.startswith("i'm "):
+        name = message.content[4:]
+        pick = random.randint(1, 2)
+        if pick == 1:
+            await message.channel.send(f"Hi {name}, I'm Alan Tang, the goat")
+        else:
+            await message.channel.send(f"Hi {name}, I'm David Tan, the fraud")
 
 
-#Main entry point
 def main() -> None:
-  bot.run(token=TOKEN)
+    bot.run(token=TOKEN)
 
 
-if __name__ == '__main__':
-  main()
+if __name__ == "__main__":
+    main()
