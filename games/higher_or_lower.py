@@ -67,15 +67,19 @@ async def start(thread, user, bot):
         "**Higher or Lower — Google Trends edition**\n"
         "Which search term has a **higher** Google Trends score? "
         "Scores are 0–100 (relative average interest, last 12 months).\n"
-        "Press **Higher** if the right term is searched more than the left, **Lower** if less.\n"
-        "Ties count as wrong. Press **Stop** to cash out."
+        "Press **Higher** if the right term is searched more than the left, **Lower** if less. "
+        "Press **Stop** to cash out."
     )
 
     while True:
-        # pick a distinct second term
-        right_term, right_score = random.choice(pool)
-        while right_term == left_term:
-            right_term, right_score = random.choice(pool)
+        # only pick terms with a different score so the answer is never a tie
+        candidates = [(t, s) for t, s in pool if s != left_score]
+        if not candidates:
+            await thread.send(
+                f"Ran out of eligible terms. Final streak: **{streak}**."
+            )
+            return
+        right_term, right_score = random.choice(candidates)
 
         view = HoLView(user.id)
         msg = await thread.send(
@@ -108,9 +112,8 @@ async def start(thread, user, bot):
         )
 
         if not correct:
-            verdict = "a tie" if right_score == left_score else "wrong"
             await thread.send(
-                f"`{right_term}` was **{right_score}** — {verdict}! Final streak: **{streak}**."
+                f"`{right_term}` was **{right_score}** — wrong! Final streak: **{streak}**."
             )
             return
 

@@ -1,16 +1,18 @@
 import asyncio
+import json
 import random
+from pathlib import Path
 
 MAX_WRONG = 6
 GUESS_TIMEOUT = 90
+WORDS_PATH = Path(__file__).resolve().parent / "data" / "hangman_words.json"
 
-WORDS = [
-    "python", "discord", "hangman", "puzzle", "keyboard", "rainbow",
-    "elephant", "guitar", "mountain", "volcano", "umbrella", "library",
-    "javascript", "octopus", "telescope", "blueprint", "harmony",
-    "festival", "bicycle", "wizard", "compass", "treasure", "diamond",
-    "penguin", "horizon", "shadow", "thunder", "crystal", "voyage",
-]
+
+def _load_words() -> dict[str, list[str]]:
+    with open(WORDS_PATH, encoding="utf-8") as f:
+        return json.load(f)["categories"]
+
+WORDS = _load_words()
 
 STAGES = [
     """
@@ -63,13 +65,15 @@ def render(word, guessed):
 
 
 async def start(thread, user, bot):
-    word = random.choice(WORDS).lower()
+    category = random.choice(list(WORDS.keys()))
+    word = random.choice(WORDS[category]).lower()
     guessed = set()
     wrong = set()
 
     await thread.send(
+        f"Category: **{category}**\n"
         f"Guess the word, one letter at a time. You get **{MAX_WRONG}** wrong guesses.\n"
-        f"```{STAGES[0]}```\nWord: `{render(word, guessed)}`"
+        f"```{STAGES[0]}```\nWord: `{render(word, guessed)}`  ({len(word)} letters)"
     )
 
     def is_guess(msg):
