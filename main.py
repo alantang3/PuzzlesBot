@@ -22,10 +22,18 @@ LOBBY_TTL = 1200  # auto-delete lobby thread after this many seconds if game nev
 POST_GAME_DELAY = 30  # seconds to leave the thread open after a game ends
 TRENDS_REFRESH_HOURS = 12
 TRENDS_DATA_PATH = Path(__file__).resolve().parent / "games" / "data" / "trends.json"
+GAME_CMD_COOLDOWN = 30  # seconds between /game uses per user
+
+# Per-user cooldown tracker for /game. user_id -> last-used unix time.
+_game_cmd_last_used: dict[int, float] = {}
 
 intents: Intents = Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Block @everyone, @here, role pings, and arbitrary user pings from any bot message.
+# Replies still ping the replied-to user. Prevents mass-mention injection via games like
+# Who Sent the Message or the "i'm" easter egg.
+SAFE_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=False, replied_user=True)
+bot = commands.Bot(command_prefix="!", intents=intents, allowed_mentions=SAFE_MENTIONS)
 
 # thread_id -> {"game": str, "mode": str, "host": int, "started": bool}
 active_lobbies: dict[int, dict] = {}
@@ -149,8 +157,9 @@ class GameSelect(Select):
 
 
 @bot.command(name="refresh_trends")
+@commands.is_owner()
 async def refresh_trends_cmd(ctx: commands.Context):
-    """Force-refresh the Google Trends dataset now."""
+    """Force-refresh the Google Trends dataset now. Bot owner only."""
     age_hours = _trends_age_hours()
     age_str = "never" if age_hours == float("inf") else f"{age_hours:.1f}h ago"
     msg = await ctx.send(f"Refreshing trends data (last refresh: {age_str})…")
@@ -159,12 +168,32 @@ async def refresh_trends_cmd(ctx: commands.Context):
     await msg.edit(content=f"{prefix} {detail}")
 
 
+@refresh_trends_cmd.error
+async def _refresh_trends_err(ctx: commands.Context, error):
+    # Silently ignore unauthorized attempts; don't reveal the command exists.
+    if isinstance(error, commands.NotOwner):
+        return
+    raise error
+
+
 @bot.tree.command(
     name="game",
     description="Start a game",
     guild=discord.Object(id=GUILD_ID),
 )
 async def game(interaction: discord.Interaction):
+    # Per-user rate limit: 1 lobby every 30 seconds.
+    now = time.time()
+    last = _game_cmd_last_used.get(interaction.user.id, 0)
+    if now - last < GAME_CMD_COOLDOWN:
+        wait = int(GAME_CMD_COOLDOWN - (now - last)) + 1
+        await interaction.response.send_message(
+            f"Slow down — wait **{wait}s** before starting another game.",
+            ephemeral=True,
+        )
+        return
+    _game_cmd_last_used[interaction.user.id] = now
+
     await interaction.response.send_message(
         "Choose a gamemode:",
         view=GameModeSelectView(),
