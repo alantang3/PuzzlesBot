@@ -128,8 +128,18 @@ class GameSelect(Select):
             "host": interaction.user.id,
             "started": False,
         }
+        jump_view = View()
+        jump_view.add_item(
+            discord.ui.Button(
+                label=f"Jump to {selected} Lobby",
+                style=discord.ButtonStyle.link,
+                url=thread.jump_url,
+            )
+        )
         await interaction.response.send_message(
-            f"Lobby created: {thread.mention}", ephemeral=True
+            f"Your **{selected}** lobby is ready.",
+            view=jump_view,
+            ephemeral=True,
         )
 
         async def cleanup():
