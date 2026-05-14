@@ -1,7 +1,9 @@
 import asyncio
+import json
 import os
 import random
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
@@ -144,6 +146,17 @@ class GameSelect(Select):
         )
 
 
+@bot.command(name="refresh_trends")
+async def refresh_trends_cmd(ctx: commands.Context):
+    """Force-refresh the Google Trends dataset now."""
+    age_hours = _trends_age_hours()
+    age_str = "never" if age_hours == float("inf") else f"{age_hours:.1f}h ago"
+    msg = await ctx.send(f"Refreshing trends data (last refresh: {age_str})…")
+    ok, detail = await _run_trends_refresh()
+    prefix = "✅" if ok else "⚠️"
+    await msg.edit(content=f"{prefix} {detail}")
+
+
 @bot.tree.command(
     name="game",
     description="Start a game",
@@ -238,20 +251,42 @@ async def start_cmd(ctx: commands.Context):
             pass
 
 
-async def _run_trends_refresh() -> None:
-    """Refresh the Google Trends dataset in a worker thread (pytrends is sync)."""
+def _trends_age_hours() -> float:
+    """How long since the scores were last actually fetched, per the JSON itself."""
+    try:
+        with open(TRENDS_DATA_PATH, encoding="utf-8") as f:
+            ts = json.load(f).get("last_refreshed")
+        if not ts:
+            return float("inf")  # never been refreshed with real data
+        last = datetime.fromisoformat(ts)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - last).total_seconds() / 3600
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return float("inf")
+
+
+async def _run_trends_refresh() -> tuple[bool, str]:
+    """Refresh in a worker thread (pytrends is sync). Returns (ok, message)."""
     try:
         from scripts.build_trends_dataset import refresh_trends_dataset
     except ImportError as e:
-        print(f"[trends] skipped — {e}")
-        return
+        msg = f"skipped — {e}"
+        print(f"[trends] {msg}")
+        return False, msg
     try:
         count = await asyncio.to_thread(refresh_trends_dataset, False)
-        print(f"[trends] refreshed {count} terms")
+        msg = f"refreshed {count} terms"
+        print(f"[trends] {msg}")
+        return True, msg
     except ImportError:
-        print("[trends] skipped — pytrends not installed (pip install pytrends)")
+        msg = "pytrends not installed (pip install pytrends)"
+        print(f"[trends] skipped — {msg}")
+        return False, msg
     except Exception as e:
-        print(f"[trends] refresh failed: {e}")
+        msg = f"refresh failed: {e}"
+        print(f"[trends] {msg}")
+        return False, msg
 
 
 @tasks.loop(hours=TRENDS_REFRESH_HOURS)
@@ -262,16 +297,13 @@ async def refresh_trends_loop() -> None:
 @refresh_trends_loop.before_loop
 async def _before_trends_loop() -> None:
     await bot.wait_until_ready()
-    # Self-heal stale data on startup: refresh now if the file is older than the interval.
-    try:
-        age_hours = (time.time() - TRENDS_DATA_PATH.stat().st_mtime) / 3600
-    except FileNotFoundError:
-        age_hours = float("inf")
+    age_hours = _trends_age_hours()
+    age_str = "never" if age_hours == float("inf") else f"{age_hours:.1f}h ago"
     if age_hours >= TRENDS_REFRESH_HOURS:
-        print(f"[trends] dataset is {age_hours:.1f}h old — refreshing on startup")
+        print(f"[trends] last refresh: {age_str} — refreshing on startup")
         await _run_trends_refresh()
     else:
-        print(f"[trends] dataset is {age_hours:.1f}h old — next refresh in {TRENDS_REFRESH_HOURS}h")
+        print(f"[trends] last refresh: {age_str} — next refresh in {TRENDS_REFRESH_HOURS}h")
 
 
 @bot.event

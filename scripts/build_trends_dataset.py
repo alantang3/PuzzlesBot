@@ -14,6 +14,7 @@ Google Trends rate-limits aggressively — bump BATCH_DELAY if you hit 429s.
 
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "games" / "data" / "trends.json"
@@ -81,6 +82,7 @@ def refresh_trends_dataset(verbose: bool = True) -> int:
 
     fresh[BASELINE] = BASELINE_SCORE
     data["terms"] = {t: fresh.get(t, data["terms"][t]) for t in terms}
+    data["last_refreshed"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     _save(data)
     if verbose:
         print(f"Wrote {len(fresh)} fresh scores to {DATA_PATH}")
