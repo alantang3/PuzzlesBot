@@ -76,10 +76,11 @@ class GameSelect(Select):
             discord.SelectOption(label="Hangman", description="Guess the word."),
             discord.SelectOption(label="Cryptograms", description="Decode the cryptograms."),
             discord.SelectOption(label="Wordle", description="Guess the 5-letter word."),
-            discord.SelectOption(label="Sports Trivia", description="Test your sports knowledge! (coming soon)"),
-            discord.SelectOption(label="Guess the Flag", description="Guess the country flag. (coming soon)"),
-            discord.SelectOption(label="Who's That Pokemon?", description="Guess the Pokemon. (coming soon)"),
-            discord.SelectOption(label="Who Sent the Message?", description="Guess the message sender. (coming soon)"),
+            discord.SelectOption(label="Sports Trivia", description="Test your sports knowledge!"),
+            discord.SelectOption(label="Guess the Flag", description="Guess the country flag."),
+            discord.SelectOption(label="Who's That Pokemon?", description="Guess the Pokemon."),
+            discord.SelectOption(label="Who Sent the Message?", description="Guess the message sender."),
+            discord.SelectOption(label="Minesweeper", description="Classic minesweeper, 9x9 with 10 mines."),
         ]
         super().__init__(
             placeholder="Choose a game to play...",
@@ -120,8 +121,9 @@ class GameSelect(Select):
         else:
             intro = (
                 f"{interaction.user.mention}, welcome to your private game lobby! "
-                f"Ping your friends to join. Once everyone's here, type `!start` to begin **{selected}**.\n"
-                f"_(Note: multiplayer support is being added — for now the game will run as single player.)_"
+                f"**Ping your friends to add them to this thread**, then type `!start` to begin **{selected}**. "
+                f"(Pinging a server member auto-adds them.)\n"
+                f"_Some games don't have multiplayer yet — they'll fall back to single-player if started in MP mode._"
             )
 
         await thread.send(intro)
@@ -204,6 +206,30 @@ class PostGameView(View):
         await self._resolve(interaction, "end")
 
 
+async def _collect_thread_players(thread, host: discord.Member) -> list[discord.Member]:
+    """Return all non-bot members currently in the thread, with the host first."""
+    players: list[discord.Member] = [host]
+    seen = {host.id}
+    try:
+        thread_members = await thread.fetch_members()
+    except discord.HTTPException:
+        return players
+    for tm in thread_members:
+        if tm.id in seen:
+            continue
+        member = thread.guild.get_member(tm.id) if thread.guild else None
+        if member is None and thread.guild is not None:
+            try:
+                member = await thread.guild.fetch_member(tm.id)
+            except discord.HTTPException:
+                continue
+        if member is None or member.bot:
+            continue
+        players.append(member)
+        seen.add(tm.id)
+    return players
+
+
 @bot.command(name="start")
 async def start_cmd(ctx: commands.Context):
     lobby = active_lobbies.get(ctx.channel.id)
@@ -221,10 +247,22 @@ async def start_cmd(ctx: commands.Context):
     if cleanup_task is not None:
         cleanup_task.cancel()
 
+    mode = lobby.get("mode", "Single Player")
+    players = await _collect_thread_players(ctx.channel, ctx.author) if mode == "Multiplayer" else [ctx.author]
+    if mode == "Multiplayer" and len(players) < 2:
+        await ctx.send(
+            "Multiplayer needs at least 2 players — ping someone into this thread first, then `!start` again."
+        )
+        lobby["started"] = False
+        return
+    if mode == "Multiplayer":
+        names = ", ".join(p.display_name for p in players)
+        await ctx.send(f"Multiplayer game starting with: **{names}**")
+
     try:
         while True:
             try:
-                await start_game(lobby["game"], ctx.channel, ctx.author, bot)
+                await start_game(lobby["game"], ctx.channel, ctx.author, bot, mode=mode, players=players)
             except Exception as e:
                 print(f"[game] {lobby['game']} crashed: {e!r}")
                 await ctx.send("The game ran into an error — closing this lobby.")

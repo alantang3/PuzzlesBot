@@ -5,6 +5,8 @@ import re
 import string
 from pathlib import Path
 
+import discord
+
 MAX_HINTS = 3
 INACTIVITY_TIMEOUT = 600  # 10 minutes before the bot gives up waiting
 QUOTES_PATH = Path(__file__).resolve().parent / "data" / "cryptogram_quotes.json"
@@ -169,3 +171,98 @@ async def start(thread, user, bot):
             "• `X=Y` to map a letter, `X=` to clear one\n"
             "• `hint`  •  `solve <full quote>`  •  `give up`"
         )
+
+
+# -----------------------------------------------------------------------------
+# Multiplayer race (solve-only)
+# -----------------------------------------------------------------------------
+
+# Cryptograms are slow; give players generous time
+MP_TIMEOUT = 900  # 15 minutes
+
+
+class _CryptoSolveModal(discord.ui.Modal, title="Decode the quote"):
+    def __init__(self, view: "_MPCryptoView"):
+        super().__init__()
+        self.view_ref = view
+        self.guess = discord.ui.TextInput(
+            label="Your decoded quote",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            placeholder="Type the full decoded text",
+        )
+        self.add_item(self.guess)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.view_ref.handle_solve(interaction, self.guess.value)
+
+
+class _MPCryptoView(discord.ui.View):
+    def __init__(self, player_ids: set[int], target_normalized: str):
+        super().__init__(timeout=MP_TIMEOUT)
+        self.player_ids = player_ids
+        self.target = target_normalized
+        self.winner_id: int | None = None
+        self.finished = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+    @discord.ui.button(label="Submit Solution", style=discord.ButtonStyle.success, emoji="🔓")
+    async def solve_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if interaction.user.id not in self.player_ids:
+            await interaction.response.send_message("You're not in this game.", ephemeral=True)
+            return
+        if self.finished.is_set():
+            await interaction.response.send_message("Round's over.", ephemeral=True)
+            return
+        await interaction.response.send_modal(_CryptoSolveModal(self))
+
+    async def handle_solve(self, interaction: discord.Interaction, raw: str):
+        async with self._lock:
+            if self.finished.is_set():
+                await interaction.response.send_message("Too late.", ephemeral=True)
+                return
+            if _normalize(raw) == self.target:
+                self.winner_id = interaction.user.id
+                await interaction.response.send_message("✅ Correct!", ephemeral=True)
+                for child in self.children:
+                    child.disabled = True
+                self.finished.set()
+            else:
+                await interaction.response.send_message(
+                    "❌ Not quite — keep working on it.", ephemeral=True
+                )
+
+
+async def start_multi(thread, players, bot):
+    quotes = _load_quotes()
+    chosen = random.choice(quotes)
+    plaintext = chosen["text"]
+    author = chosen["author"]
+    cipher = _make_cipher()
+    encoded = _encode(plaintext, cipher)
+    target = _normalize(plaintext)
+
+    player_ids = {p.id for p in players}
+    players_by_id = {p.id: p for p in players}
+
+    names = ", ".join(p.display_name for p in players)
+    view = _MPCryptoView(player_ids, target)
+    await thread.send(
+        f"**Cryptograms — MP Race**\n"
+        f"Same cipher for all players. Solve it mentally (or on paper). "
+        f"First to submit the correct decoded quote wins. Unlimited submissions, **{MP_TIMEOUT // 60} minutes** max.\n"
+        f"Spaces and punctuation are unchanged. No letter maps to itself. "
+        f"Submissions are private — only you see whether you got it right.\n"
+        f"Players: {names}\n\n```{encoded}```",
+        view=view,
+    )
+
+    try:
+        await asyncio.wait_for(view.finished.wait(), timeout=MP_TIMEOUT)
+    except asyncio.TimeoutError:
+        await thread.send(f"⏱ Time's up! The quote was:\n> {plaintext}\n— **{author}**")
+        return
+
+    if view.winner_id is not None:
+        winner = players_by_id[view.winner_id]
+        await thread.send(f"🏆 **{winner.display_name}** solved it!\n> {plaintext}\n— **{author}**")

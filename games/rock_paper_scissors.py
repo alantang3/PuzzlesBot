@@ -1,3 +1,4 @@
+import asyncio
 import random
 
 import discord
@@ -85,3 +86,107 @@ async def start(thread, user, bot):
         await thread.send(f"🏆 You took it **{wins}–{losses}**! GG.")
     else:
         await thread.send(f"Bot wins **{losses}–{wins}**. Better luck next time.")
+
+
+# -----------------------------------------------------------------------------
+# Multiplayer (2-player) — best-of-5
+# -----------------------------------------------------------------------------
+
+MP_TARGET_WINS = 3
+MP_ROUND_TIMEOUT = 45
+
+
+class _MPRPSView(discord.ui.View):
+    def __init__(self, players):
+        super().__init__(timeout=MP_ROUND_TIMEOUT)
+        self.player_ids = {p.id for p in players}
+        self.players_by_id = {p.id: p for p in players}
+        self.picks: dict[int, str] = {}
+        self.finished = asyncio.Event()
+
+    async def _pick(self, interaction: discord.Interaction, choice: str):
+        if interaction.user.id not in self.player_ids:
+            await interaction.response.send_message(
+                "👀 You're spectating this match — only the two players can pick.", ephemeral=True
+            )
+            return
+        if interaction.user.id in self.picks:
+            await interaction.response.send_message(
+                f"You already picked **{self.picks[interaction.user.id]}** — locked in.", ephemeral=True
+            )
+            return
+        self.picks[interaction.user.id] = choice
+        await interaction.response.send_message(
+            f"You picked **{choice}** {EMOJI[choice]}. Waiting for opponent…", ephemeral=True
+        )
+        if len(self.picks) == len(self.player_ids):
+            for child in self.children:
+                child.disabled = True
+            try:
+                await interaction.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+            self.finished.set()
+
+    @discord.ui.button(label="Rock 🪨", style=discord.ButtonStyle.primary)
+    async def rock(self, interaction, _): await self._pick(interaction, "rock")
+
+    @discord.ui.button(label="Paper 📄", style=discord.ButtonStyle.primary)
+    async def paper(self, interaction, _): await self._pick(interaction, "paper")
+
+    @discord.ui.button(label="Scissors ✂️", style=discord.ButtonStyle.primary)
+    async def scissors(self, interaction, _): await self._pick(interaction, "scissors")
+
+
+async def start_multi(thread, players, bot):
+    if len(players) < 2:
+        await thread.send("RPS multiplayer needs 2 players. Falling back to single-player.")
+        await start(thread, players[0], bot)
+        return
+    active = players[:2]
+    spectators = players[2:]
+    p1, p2 = active
+    wins = {p1.id: 0, p2.id: 0}
+
+    header = (
+        f"**Rock Paper Scissors — Multiplayer**\n"
+        f"{p1.display_name} vs {p2.display_name} — first to **{MP_TARGET_WINS}** wins."
+    )
+    if spectators:
+        names = ", ".join(s.display_name for s in spectators)
+        header += f"\n👀 Spectating: {names}"
+    await thread.send(header)
+
+    round_num = 0
+    while max(wins.values()) < MP_TARGET_WINS:
+        round_num += 1
+        view = _MPRPSView(active)
+        await thread.send(
+            f"**Round {round_num}** — score {p1.display_name} **{wins[p1.id]}** | "
+            f"**{wins[p2.id]}** {p2.display_name}\nBoth players: pick your move.",
+            view=view,
+        )
+        try:
+            await asyncio.wait_for(view.finished.wait(), timeout=MP_ROUND_TIMEOUT)
+        except asyncio.TimeoutError:
+            missing = [pl.display_name for pl in active if pl.id not in view.picks]
+            await thread.send(f"⏱ Out of time. Waiting on: **{', '.join(missing)}**. Round skipped.")
+            continue
+
+        c1, c2 = view.picks[p1.id], view.picks[p2.id]
+        line = f"{p1.display_name}: {EMOJI[c1]}  vs  {EMOJI[c2]} :{p2.display_name}  —  "
+        result = decide(c1, c2)
+        if result == "tie":
+            line += "Tie!"
+        elif result == "p1":
+            wins[p1.id] += 1
+            line += f"**{p1.display_name}** wins the round."
+        else:
+            wins[p2.id] += 1
+            line += f"**{p2.display_name}** wins the round."
+        await thread.send(line)
+
+    winner = p1 if wins[p1.id] > wins[p2.id] else p2
+    await thread.send(
+        f"🏆 **{winner.display_name}** wins the match **{wins[winner.id]}–{wins[(p1 if winner is p2 else p2).id]}**!"
+    )
