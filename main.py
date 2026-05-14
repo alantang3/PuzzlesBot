@@ -16,7 +16,8 @@ from games import GAMES, start_game
 load_dotenv()
 TOKEN: Final[str] = os.getenv("DISCORD_TOKEN")
 GUILD_ID: Final[int] = 1353035066082721896
-LOBBY_TTL = 1200  # auto-delete lobby thread after this many seconds
+LOBBY_TTL = 1200  # auto-delete lobby thread after this many seconds if game never starts
+POST_GAME_DELAY = 30  # seconds to leave the thread open after a game ends
 TRENDS_REFRESH_HOURS = 12
 TRENDS_DATA_PATH = Path(__file__).resolve().parent / "games" / "data" / "trends.json"
 
@@ -122,26 +123,6 @@ class GameSelect(Select):
             )
 
         await thread.send(intro)
-        active_lobbies[thread.id] = {
-            "game": selected,
-            "mode": self.mode,
-            "host": interaction.user.id,
-            "started": False,
-        }
-        jump_view = View()
-        jump_view.add_item(
-            discord.ui.Button(
-                label=f"Jump to {selected} Lobby",
-                style=discord.ButtonStyle.link,
-                url=thread.jump_url,
-            )
-        )
-        await interaction.response.send_message(
-            f"Your **{selected}** lobby is ready.",
-            view=jump_view,
-            ephemeral=True,
-        )
-
         async def cleanup():
             await asyncio.sleep(LOBBY_TTL)
             active_lobbies.pop(thread.id, None)
@@ -150,7 +131,17 @@ class GameSelect(Select):
             except discord.HTTPException:
                 pass
 
-        asyncio.create_task(cleanup())
+        cleanup_task = asyncio.create_task(cleanup())
+        active_lobbies[thread.id] = {
+            "game": selected,
+            "mode": self.mode,
+            "host": interaction.user.id,
+            "started": False,
+            "cleanup_task": cleanup_task,
+        }
+        await interaction.response.send_message(
+            f"Lobby created: {thread.mention}", ephemeral=True
+        )
 
 
 @bot.tree.command(
@@ -166,6 +157,40 @@ async def game(interaction: discord.Interaction):
     )
 
 
+class PostGameView(View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.choice: str | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Only the lobby host can decide.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _resolve(self, interaction: discord.Interaction, choice: str) -> None:
+        self.choice = choice
+        await interaction.response.defer()
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Play Again", style=discord.ButtonStyle.success)
+    async def play_again(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, "again")
+
+    @discord.ui.button(label="End", style=discord.ButtonStyle.danger)
+    async def end(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, "end")
+
+
 @bot.command(name="start")
 async def start_cmd(ctx: commands.Context):
     lobby = active_lobbies.get(ctx.channel.id)
@@ -179,7 +204,38 @@ async def start_cmd(ctx: commands.Context):
         return
 
     lobby["started"] = True
-    await start_game(lobby["game"], ctx.channel, ctx.author, bot)
+    cleanup_task = lobby.get("cleanup_task")
+    if cleanup_task is not None:
+        cleanup_task.cancel()
+
+    try:
+        while True:
+            try:
+                await start_game(lobby["game"], ctx.channel, ctx.author, bot)
+            except Exception as e:
+                print(f"[game] {lobby['game']} crashed: {e!r}")
+                await ctx.send("The game ran into an error — closing this lobby.")
+                break
+
+            view = PostGameView(ctx.author.id)
+            await ctx.send(
+                f"Game over! Play **{lobby['game']}** again, or end the lobby?",
+                view=view,
+            )
+            timed_out = await view.wait()
+            if timed_out or view.choice != "again":
+                break
+    finally:
+        active_lobbies.pop(ctx.channel.id, None)
+        try:
+            await ctx.send(f"Closing this lobby in {POST_GAME_DELAY}s.")
+        except discord.HTTPException:
+            pass
+        await asyncio.sleep(POST_GAME_DELAY)
+        try:
+            await ctx.channel.delete()
+        except discord.HTTPException:
+            pass
 
 
 async def _run_trends_refresh() -> None:
