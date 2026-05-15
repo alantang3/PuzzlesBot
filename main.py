@@ -17,7 +17,6 @@ from games import GAMES, start_game
 
 load_dotenv()
 TOKEN: Final[str] = os.getenv("DISCORD_TOKEN")
-GUILD_ID: Final[int] = 1353035066082721896
 LOBBY_TTL = 1200  # auto-delete lobby thread after this many seconds if game never starts
 POST_GAME_DELAY = 30  # seconds to leave the thread open after a game ends
 TRENDS_REFRESH_HOURS = 12
@@ -179,7 +178,6 @@ async def _refresh_trends_err(ctx: commands.Context, error):
 @bot.tree.command(
     name="game",
     description="Start a game",
-    guild=discord.Object(id=GUILD_ID),
 )
 async def game(interaction: discord.Interaction):
     # Per-user rate limit: 1 lobby every 30 seconds.
@@ -376,10 +374,10 @@ async def _before_trends_loop() -> None:
 @bot.event
 async def on_ready() -> None:
     await bot.wait_until_ready()
-    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    synced = await bot.tree.sync()  # global sync — propagates to all servers (up to ~1h first time)
     if not refresh_trends_loop.is_running():
         refresh_trends_loop.start()
-    print(f"{bot.user} is now running!")
+    print(f"{bot.user} is now running! Synced {len(synced)} global command(s).")
 
 
 @bot.event
