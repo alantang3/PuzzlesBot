@@ -132,28 +132,40 @@ MIN_WORD_LEN = 3
 MAX_WORD_LEN = 20
 
 
+MAX_CATEGORY_LEN = 40
+
+
 class _SetWordModal(discord.ui.Modal, title="Pick your word"):
     def __init__(self):
         super().__init__()
+        self.category_input = discord.ui.TextInput(
+            label="Category / hint",
+            min_length=2,
+            max_length=MAX_CATEGORY_LEN,
+            placeholder="e.g. Animals, Movies, Food...",
+        )
         self.word_input = discord.ui.TextInput(
             label=f"Word ({MIN_WORD_LEN}-{MAX_WORD_LEN} letters, no spaces)",
             min_length=MIN_WORD_LEN,
             max_length=MAX_WORD_LEN,
             placeholder="e.g. elephant",
         )
+        self.add_item(self.category_input)
         self.add_item(self.word_input)
         self.future: asyncio.Future = asyncio.get_event_loop().create_future()
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.word_input.value.strip().lower()
+        category = self.category_input.value.strip()
         if not raw.isalpha():
             await interaction.response.send_message(
-                "Letters only, no spaces or punctuation.", ephemeral=True
+                "Letters only, no spaces or punctuation in the word.", ephemeral=True
             )
             return
-        self.future.set_result(raw)
+        self.future.set_result((raw, category))
         await interaction.response.send_message(
-            f"Word locked in (**{len(raw)}** letters). The other player will start guessing.",
+            f"Word locked in (**{len(raw)}** letters, category **{category}**). "
+            f"The other player will start guessing.",
             ephemeral=True,
         )
 
@@ -188,19 +200,21 @@ async def _run_mp_round(thread, bot, picker, guesser) -> int:
     )
 
     deadline = asyncio.get_event_loop().time() + MP_SETUP_TIMEOUT
-    word = None
-    while word is None:
+    result = None
+    while result is None:
         remaining = deadline - asyncio.get_event_loop().time()
         if remaining <= 0:
             await thread.send(f"⏱ {picker.display_name} didn't pick a word. Round skipped.")
             return MAX_WRONG + 1
         if view.modal is not None:
             try:
-                word = await asyncio.wait_for(view.modal.future, timeout=remaining)
+                result = await asyncio.wait_for(view.modal.future, timeout=remaining)
             except asyncio.TimeoutError:
                 continue
         else:
             await asyncio.sleep(0.5)
+
+    word, category = result
 
     try:
         await setup_msg.edit(view=None)
@@ -211,6 +225,7 @@ async def _run_mp_round(thread, bot, picker, guesser) -> int:
     wrong: set[str] = set()
 
     await thread.send(
+        f"Category: **{category}**\n"
         f"Word picked: **{len(word)}** letters. **{guesser.display_name}**, type one letter at a time.\n"
         f"```{STAGES[0]}```\nWord: `{render(word, guessed)}`"
     )
@@ -242,7 +257,7 @@ async def _run_mp_round(thread, bot, picker, guesser) -> int:
                 )
                 return len(wrong)
             await thread.send(
-                f"✓ `{letter}` is in.\n"
+                f"✓ `{letter}` is in. Category: **{category}**\n"
                 f"```{STAGES[len(wrong)]}```\nWord: `{render(word, guessed)}`  "
                 f"Wrong: `{', '.join(sorted(wrong)) or '—'}`"
             )
@@ -254,7 +269,7 @@ async def _run_mp_round(thread, bot, picker, guesser) -> int:
                 )
                 return MAX_WRONG + 1
             await thread.send(
-                f"✗ `{letter}` isn't in.\n"
+                f"✗ `{letter}` isn't in. Category: **{category}**\n"
                 f"```{STAGES[len(wrong)]}```\nWord: `{render(word, guessed)}`  "
                 f"Wrong: `{', '.join(sorted(wrong))}`"
             )
