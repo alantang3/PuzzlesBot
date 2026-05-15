@@ -84,6 +84,7 @@ async def start(thread, user, bot):
         "• `X=` — unmap `X` (clear that guess)\n"
         f"• `hint` — reveal one correct mapping (you get **{MAX_HINTS}** of these)\n"
         "• `solve <your full guess>` — submit the whole decoded quote\n"
+        "• `reset` — clear all your mappings and start the board over\n"
         "• `give up` — reveal the answer and end the round\n\n"
         "Wrong mappings are free — experiment all you want. Spaces and punctuation are unchanged. "
         "No cipher letter maps to itself. The puzzle wins automatically when every letter is mapped correctly.\n"
@@ -118,6 +119,11 @@ async def start(thread, user, bot):
         if cmd == "give up":
             await thread.send(f"Game over. The quote was:\n> {plaintext}\n— **{author}**")
             return
+
+        if cmd == "reset":
+            mapping.clear()
+            await announce_state(prefix="🔄 Board reset — all mappings cleared. (Used hints aren't refunded.)")
+            continue
 
         if cmd == "hint":
             if hints_used >= MAX_HINTS:
@@ -169,68 +175,173 @@ async def start(thread, user, bot):
         await thread.send(
             "I didn't catch that. Valid commands:\n"
             "• `X=Y` to map a letter, `X=` to clear one\n"
-            "• `hint`  •  `solve <full quote>`  •  `give up`"
+            "• `hint`  •  `solve <full quote>`  •  `reset`  •  `give up`"
         )
 
 
 # -----------------------------------------------------------------------------
-# Multiplayer race (solve-only)
+# Multiplayer race — private per-player letter mapping (like single player)
 # -----------------------------------------------------------------------------
 
-# Cryptograms are slow; give players generous time
-MP_TIMEOUT = 900  # 15 minutes
+MP_TIMEOUT = 1200  # 20 minutes — cryptograms are slow
+
+# One token like "L=T" or "L=" (clear). Tokens separated by commas/whitespace/newlines.
+_MP_TOKEN_RE = re.compile(r"^([a-zA-Z])=([a-zA-Z]?)$")
 
 
-class _CryptoSolveModal(discord.ui.Modal, title="Decode the quote"):
-    def __init__(self, view: "_MPCryptoView"):
-        super().__init__()
-        self.view_ref = view
-        self.guess = discord.ui.TextInput(
-            label="Your decoded quote",
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-            placeholder="Type the full decoded text",
-        )
-        self.add_item(self.guess)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await self.view_ref.handle_solve(interaction, self.guess.value)
-
-
-class _MPCryptoView(discord.ui.View):
-    def __init__(self, player_ids: set[int], target_normalized: str):
-        super().__init__(timeout=MP_TIMEOUT)
-        self.player_ids = player_ids
-        self.target = target_normalized
+class _MPCryptoGame:
+    def __init__(self, players, encoded: str, target_mapping: dict[str, str],
+                 target_normalized: str, plaintext: str, author: str):
+        self.player_ids = {p.id for p in players}
+        self.players_by_id = {p.id: p for p in players}
+        self.encoded = encoded
+        self.cipher_letters = {c for c in encoded if c.isalpha()}
+        self.target_mapping = target_mapping       # cipher letter -> correct plain letter
+        self.target_normalized = target_normalized
+        self.plaintext = plaintext
+        self.author = author
+        self.mappings: dict[int, dict[str, str]] = {}  # player id -> their cipher->plain map
         self.winner_id: int | None = None
         self.finished = asyncio.Event()
         self._lock = asyncio.Lock()
 
-    @discord.ui.button(label="Submit Solution", style=discord.ButtonStyle.success, emoji="🔓")
-    async def solve_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if interaction.user.id not in self.player_ids:
-            await interaction.response.send_message("You're not in this game.", ephemeral=True)
-            return
-        if self.finished.is_set():
-            await interaction.response.send_message("Round's over.", ephemeral=True)
-            return
-        await interaction.response.send_modal(_CryptoSolveModal(self))
+    def _player_map(self, uid: int) -> dict[str, str]:
+        return self.mappings.setdefault(uid, {})
 
-    async def handle_solve(self, interaction: discord.Interaction, raw: str):
-        async with self._lock:
-            if self.finished.is_set():
-                await interaction.response.send_message("Too late.", ephemeral=True)
+    def _is_solved(self, uid: int) -> bool:
+        m = self.mappings.get(uid, {})
+        return all(m.get(c) == self.target_mapping[c] for c in self.cipher_letters)
+
+    def _apply_player(self, uid: int) -> str:
+        return _apply(self.encoded, self.mappings.get(uid, {}))
+
+    def _workspace_text(self, uid: int, note: str = "") -> str:
+        m = self.mappings.get(uid, {})
+        lines = []
+        if note:
+            lines.append(note)
+        lines.append(f"Mappings: {_format_mappings(m)}")
+        lines.append(f"```\nCipher:  {self.encoded}\nWorking: {self._apply_player(uid)}\n```")
+        lines.append("Add more with the button below: `X=Y` to map, `X=` to clear "
+                     "(comma or newline separated). Or type the full quote to solve.")
+        return "\n".join(lines)
+
+
+def _parse_tokens(raw: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Return ([(cipher, plain_or_empty)], [bad_tokens])."""
+    pairs, bad = [], []
+    for tok in re.split(r"[,\s]+", raw.strip()):
+        if not tok:
+            continue
+        m = _MP_TOKEN_RE.match(tok)
+        if not m:
+            bad.append(tok)
+            continue
+        pairs.append((m.group(1).upper(), m.group(2).upper()))
+    return pairs, bad
+
+
+class _MappingModal(discord.ui.Modal, title="Crack the cipher"):
+    def __init__(self, game: _MPCryptoGame):
+        super().__init__()
+        self.game = game
+        self.maps = discord.ui.TextInput(
+            label="Letter mappings (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=300,
+            placeholder="e.g.  L=T, A=E, R=S   ( X= clears one  •  type  reset  to clear all )",
+        )
+        self.full = discord.ui.TextInput(
+            label="OR full decoded quote (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+            placeholder="Type the entire decoded sentence to solve outright",
+        )
+        self.add_item(self.maps)
+        self.add_item(self.full)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.game.process(interaction, self.maps.value, self.full.value)
+
+
+class _WorkspaceView(discord.ui.View):
+    """A single 'open my workspace / continue solving' button. Reused for the public
+    launcher and each player's private ephemeral follow-ups."""
+
+    def __init__(self, game: _MPCryptoGame):
+        super().__init__(timeout=MP_TIMEOUT)
+        self.game = game
+
+    @discord.ui.button(label="Work on puzzle", style=discord.ButtonStyle.primary, emoji="🔓")
+    async def work(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if interaction.user.id not in self.game.player_ids:
+            await interaction.response.send_message(
+                "👀 You're spectating — only players can solve.", ephemeral=True
+            )
+            return
+        if self.game.finished.is_set():
+            await interaction.response.send_message("This round is over.", ephemeral=True)
+            return
+        await interaction.response.send_modal(_MappingModal(self.game))
+
+
+def _attach_process(game: _MPCryptoGame):
+    async def process(interaction: discord.Interaction, maps_raw: str, full_raw: str):
+        async with game._lock:
+            if game.finished.is_set():
+                await interaction.response.send_message("Too late — someone solved it.", ephemeral=True)
                 return
-            if _normalize(raw) == self.target:
-                self.winner_id = interaction.user.id
-                await interaction.response.send_message("✅ Correct!", ephemeral=True)
-                for child in self.children:
-                    child.disabled = True
-                self.finished.set()
-            else:
+
+            # Full-solution path takes priority
+            if full_raw and _normalize(full_raw) == game.target_normalized:
+                game.winner_id = interaction.user.id
+                game.finished.set()
                 await interaction.response.send_message(
-                    "❌ Not quite — keep working on it.", ephemeral=True
+                    f"✅ Correct! You cracked it.", ephemeral=True
                 )
+                return
+
+            note = ""
+            if maps_raw.strip().lower() == "reset":
+                game._player_map(interaction.user.id).clear()
+                await interaction.response.send_message(
+                    game._workspace_text(interaction.user.id, "🔄 Board reset — all your mappings cleared."),
+                    view=_WorkspaceView(game),
+                    ephemeral=True,
+                )
+                return
+            if maps_raw.strip():
+                pairs, bad = _parse_tokens(maps_raw)
+                pm = game._player_map(interaction.user.id)
+                for c_letter, p_letter in pairs:
+                    if c_letter not in game.cipher_letters:
+                        continue  # ignore letters not in the cipher
+                    if p_letter == "":
+                        pm.pop(c_letter, None)
+                    else:
+                        pm[c_letter] = p_letter
+                if bad:
+                    note = f"⚠️ Ignored unparseable: `{', '.join(bad[:5])}`"
+            elif full_raw:
+                note = "❌ That full guess wasn't right — keep working."
+
+            if game._is_solved(interaction.user.id):
+                game.winner_id = interaction.user.id
+                game.finished.set()
+                await interaction.response.send_message(
+                    "✅ Your mapping fully decodes the quote — you win!", ephemeral=True
+                )
+                return
+
+            await interaction.response.send_message(
+                game._workspace_text(interaction.user.id, note),
+                view=_WorkspaceView(game),
+                ephemeral=True,
+            )
+
+    game.process = process  # type: ignore[attr-defined]
 
 
 async def start_multi(thread, players, bot):
@@ -239,30 +350,33 @@ async def start_multi(thread, players, bot):
     plaintext = chosen["text"]
     author = chosen["author"]
     cipher = _make_cipher()
+    decipher = {v: k for k, v in cipher.items()}
     encoded = _encode(plaintext, cipher)
-    target = _normalize(plaintext)
+    cipher_letters = {c for c in encoded if c.isalpha()}
+    target_mapping = {c: decipher[c] for c in cipher_letters}
 
-    player_ids = {p.id for p in players}
-    players_by_id = {p.id: p for p in players}
+    game = _MPCryptoGame(
+        players, encoded, target_mapping, _normalize(plaintext), plaintext, author
+    )
+    _attach_process(game)
 
     names = ", ".join(p.display_name for p in players)
-    view = _MPCryptoView(player_ids, target)
     await thread.send(
         f"**Cryptograms — MP Race**\n"
-        f"Same cipher for all players. Solve it mentally (or on paper). "
-        f"First to submit the correct decoded quote wins. Unlimited submissions, **{MP_TIMEOUT // 60} minutes** max.\n"
-        f"Spaces and punctuation are unchanged. No letter maps to itself. "
-        f"Submissions are private — only you see whether you got it right.\n"
+        f"Same cipher for everyone. Click **Work on puzzle** to open your **private** "
+        f"workspace and map letters one at a time (just like single player) — nobody else "
+        f"sees your progress. First to fully crack it wins. **{MP_TIMEOUT // 60} min** limit.\n"
+        f"Spaces and punctuation are unchanged. No letter maps to itself.\n"
         f"Players: {names}\n\n```{encoded}```",
-        view=view,
+        view=_WorkspaceView(game),
     )
 
     try:
-        await asyncio.wait_for(view.finished.wait(), timeout=MP_TIMEOUT)
+        await asyncio.wait_for(game.finished.wait(), timeout=MP_TIMEOUT)
     except asyncio.TimeoutError:
         await thread.send(f"⏱ Time's up! The quote was:\n> {plaintext}\n— **{author}**")
         return
 
-    if view.winner_id is not None:
-        winner = players_by_id[view.winner_id]
+    if game.winner_id is not None:
+        winner = game.players_by_id[game.winner_id]
         await thread.send(f"🏆 **{winner.display_name}** solved it!\n> {plaintext}\n— **{author}**")
