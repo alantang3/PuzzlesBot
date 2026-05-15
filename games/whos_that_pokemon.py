@@ -7,7 +7,7 @@ import aiohttp
 import discord
 
 MAX_GUESSES = 3
-GUESS_TIMEOUT = 45
+GUESS_TIMEOUT = 60
 ROUNDS = 5
 MAX_POKEMON_ID = 1025  # current Pokédex national-ID ceiling; safe to fetch
 INTERMISSION = 3
@@ -31,29 +31,53 @@ async def _fetch_sprite(session: aiohttp.ClientSession, url: str) -> bytes:
         return await resp.read()
 
 
+MAX_SILHOUETTE_DIM = 400  # downscale large official artwork for speed + consistency
+
+
+def _sprite_candidates(data: dict) -> list[str]:
+    """Prioritized sprite URLs for a Pokémon. Official artwork is the most
+    complete and cleanest source; the classic front_default is missing for
+    many Pokémon, so it's only a last resort. SVG (dream_world) is skipped
+    since Pillow can't rasterize it without extra deps."""
+    sprites = data.get("sprites") or {}
+    other = sprites.get("other") or {}
+    ordered = [
+        (other.get("official-artwork") or {}).get("front_default"),
+        (other.get("home") or {}).get("front_default"),
+        sprites.get("front_default"),
+    ]
+    out = []
+    for url in ordered:
+        if url and url.lower().endswith((".png", ".jpg", ".jpeg")) and url not in out:
+            out.append(url)
+    return out
+
+
 def _make_silhouette(image_bytes: bytes) -> io.BytesIO:
-    """Convert non-transparent pixels of a PNG sprite to solid black."""
+    """Build a solid-black silhouette from a sprite's alpha channel.
+    Uses the alpha band directly (fast, no Python pixel loop) so it handles
+    large official artwork fine, downscaling oversized images first."""
     try:
         from PIL import Image
     except ImportError:
         raise RuntimeError("Pillow not installed — pip install pillow")
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-    pixels = img.load()
-    for y in range(img.height):
-        for x in range(img.width):
-            r, g, b, a = pixels[x, y]
-            if a > 0:
-                pixels[x, y] = (0, 0, 0, a)
+    if max(img.size) > MAX_SILHOUETTE_DIM:
+        img.thumbnail((MAX_SILHOUETTE_DIM, MAX_SILHOUETTE_DIM))
+    alpha = img.getchannel("A")
+    silhouette = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    silhouette.putalpha(alpha)  # opaque pixels -> solid black, transparent stays clear
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    silhouette.save(buf, format="PNG")
     buf.seek(0)
     return buf
 
 
-async def _prepare_round(session: aiohttp.ClientSession, attempts: int = 10):
-    """Pick a Pokémon, fetch its sprite, and build a silhouette — retrying with a
-    different Pokémon if any step fails (bad/empty/non-image bytes). Returns
-    (pokemon_data, silhouette_BytesIO) or None if every attempt failed.
+async def _prepare_round(session: aiohttp.ClientSession, attempts: int = 12):
+    """Pick a Pokémon and build a silhouette, trying each available sprite
+    source (official artwork, then home, then classic) before giving up on
+    that Pokémon and trying a different one. Returns
+    (pokemon_data, silhouette_BytesIO, reveal_url) or None.
     Raises RuntimeError only if Pillow itself is missing."""
     for _ in range(attempts):
         pid = random.randint(1, MAX_POKEMON_ID)
@@ -61,22 +85,20 @@ async def _prepare_round(session: aiohttp.ClientSession, attempts: int = 10):
             data = await _fetch_pokemon(session, pid)
         except Exception:
             continue
-        sprite_url = (data.get("sprites") or {}).get("front_default")
-        if not sprite_url:
-            continue
-        try:
-            sprite_bytes = await _fetch_sprite(session, sprite_url)
-        except Exception:
-            continue
-        if not sprite_bytes or len(sprite_bytes) < 100:
-            continue  # empty or implausibly tiny — not a real sprite
-        try:
-            silhouette = _make_silhouette(sprite_bytes)
-        except RuntimeError:
-            raise  # Pillow not installed — no point retrying
-        except Exception:
-            continue  # unidentifiable/corrupt image — try a different Pokémon
-        return data, silhouette
+        for url in _sprite_candidates(data):
+            try:
+                sprite_bytes = await _fetch_sprite(session, url)
+            except Exception:
+                continue
+            if not sprite_bytes or len(sprite_bytes) < 100:
+                continue
+            try:
+                silhouette = _make_silhouette(sprite_bytes)
+            except RuntimeError:
+                raise  # Pillow not installed — no point retrying
+            except Exception:
+                continue  # unidentifiable image from this source — try next source
+            return data, silhouette, url
     return None
 
 
@@ -107,9 +129,8 @@ async def start(thread, user, bot):
                 await thread.send("Couldn't get a usable Pokémon image after several tries. Round cancelled.")
                 break
 
-            pokemon, silhouette = prepared
+            pokemon, silhouette, sprite_url = prepared
             name = pokemon["name"]
-            sprite_url = pokemon["sprites"]["front_default"]
             normalized_target = _normalize(name)
 
             embed = discord.Embed(title=f"Round {round_num}/{ROUNDS}", description="Who's that Pokémon?")
@@ -166,7 +187,7 @@ async def start(thread, user, bot):
 # Multiplayer race mode
 # -----------------------------------------------------------------------------
 
-MP_ROUND_TIMEOUT = 30
+MP_ROUND_TIMEOUT = 60
 
 
 class _PokemonGuessModal(discord.ui.Modal, title="Who's that Pokémon?"):
@@ -256,9 +277,8 @@ async def start_multi(thread, players, bot):
                 await thread.send("Couldn't get a usable Pokémon image after several tries. Stopping.")
                 break
 
-            pokemon, silhouette = prepared
+            pokemon, silhouette, sprite_url = prepared
             name = pokemon["name"]
-            sprite_url = pokemon["sprites"]["front_default"]
             normalized_target = _normalize(name)
 
             scoreboard = " | ".join(f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids)

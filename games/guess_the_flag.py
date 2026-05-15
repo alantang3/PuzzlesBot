@@ -106,7 +106,7 @@ async def start(thread, user, bot):
 # Multiplayer race mode
 # -----------------------------------------------------------------------------
 
-MP_ROUND_TIMEOUT = 30
+MP_ROUND_TIMEOUT = 60
 
 
 class _FlagGuessModal(discord.ui.Modal, title="Guess the country"):
@@ -122,7 +122,9 @@ class _FlagGuessModal(discord.ui.Modal, title="Guess the country"):
 
 class _MPFlagView(discord.ui.View):
     def __init__(self, player_ids: set[int], correct_name: str, valid: set[str]):
-        super().__init__(timeout=MP_ROUND_TIMEOUT)
+        # Outlive the round so late clicks get a friendly message, not
+        # Discord's generic "interaction failed".
+        super().__init__(timeout=MP_ROUND_TIMEOUT + 20)
         self.player_ids = player_ids
         self.correct_name = correct_name
         self.valid = valid
@@ -185,23 +187,41 @@ async def start_multi(thread, players, bot):
     )
 
     for i, correct in enumerate(chosen_pool, 1):
-        valid = _valid_answers(correct["name"])
-        scoreboard = " | ".join(f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids)
-        embed = discord.Embed(title=f"Round {i}/{total}", description="Whose flag is this?")
-        embed.set_image(url=FLAG_URL.format(code=correct["code"]))
-        view = _MPFlagView(player_ids, correct["name"], valid)
-        await thread.send(content=scoreboard, embed=embed, view=view)
         try:
-            await asyncio.wait_for(view.finished.wait(), timeout=MP_ROUND_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
+            valid = _valid_answers(correct["name"])
+            scoreboard = " | ".join(
+                f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids
+            )
+            embed = discord.Embed(title=f"Round {i}/{total}", description="Whose flag is this?")
+            embed.set_image(url=FLAG_URL.format(code=correct["code"]))
+            view = _MPFlagView(player_ids, correct["name"], valid)
+            await thread.send(content=scoreboard, embed=embed, view=view)
 
-        if view.winner_id is not None:
-            scores[view.winner_id] += 1
-            winner = players_by_id[view.winner_id]
-            await thread.send(f"✅ **{winner.display_name}** got it! That was **{correct['name']}**.")
-        else:
-            await thread.send(f"⏱ No one got it. That was **{correct['name']}**.")
+            try:
+                await asyncio.wait_for(view.finished.wait(), timeout=MP_ROUND_TIMEOUT)
+            except asyncio.TimeoutError:
+                pass
+
+            # Atomically close the round so a late modal submit can't score
+            # into a dead round or crash the loop.
+            async with view._lock:
+                view.finished.set()
+                round_winner_id = view.winner_id
+
+            if round_winner_id is not None:
+                scores[round_winner_id] += 1
+                winner = players_by_id[round_winner_id]
+                await thread.send(f"✅ **{winner.display_name}** got it! That was **{correct['name']}**.")
+            else:
+                await thread.send(f"⏱ No one got it. That was **{correct['name']}**.")
+        except Exception as e:
+            # One bad round (e.g. transient Discord send failure) shouldn't kill
+            # the whole game — log it and move on.
+            print(f"[guess_the_flag MP] round {i} error: {e!r}")
+            try:
+                await thread.send(f"⚠️ Round {i} hit a snag — skipping to the next flag.")
+            except discord.HTTPException:
+                pass
 
         if i < total:
             await asyncio.sleep(INTERMISSION)
