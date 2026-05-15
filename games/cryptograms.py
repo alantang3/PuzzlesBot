@@ -374,6 +374,10 @@ async def start_multi(thread, players, bot):
     try:
         await asyncio.wait_for(game.finished.wait(), timeout=MP_TIMEOUT)
     except asyncio.TimeoutError:
+        # Close the game so a late workspace submit can't declare a winner
+        # after we've already announced time-out.
+        async with game._lock:
+            game.finished.set()
         await thread.send(f"⏱ Time's up! The quote was:\n> {plaintext}\n— **{author}**")
         return
 

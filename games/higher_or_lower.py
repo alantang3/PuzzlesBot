@@ -135,44 +135,48 @@ MP_ROUND_TIMEOUT = 20
 
 class _MPHoLView(discord.ui.View):
     def __init__(self, player_ids: set[int], correct: str):
-        super().__init__(timeout=MP_ROUND_TIMEOUT)
+        # Outlive the round so late clicks get a friendly message instead of
+        # Discord's generic "interaction failed".
+        super().__init__(timeout=MP_ROUND_TIMEOUT + 20)
         self.player_ids = player_ids
         self.correct = correct
         self.locked_out: set[int] = set()
         self.winner_id: int | None = None
         self.finished = _aio.Event()
+        self._lock = _aio.Lock()
 
     async def _click(self, interaction: discord.Interaction, choice: str):
         if interaction.user.id not in self.player_ids:
             await interaction.response.send_message("You're not in this game.", ephemeral=True)
             return
-        if interaction.user.id in self.locked_out:
-            await interaction.response.send_message(
-                "You're locked out of this round. Wait for the next one.", ephemeral=True
-            )
-            return
-        if self.finished.is_set():
-            await interaction.response.send_message("Too late — round's over.", ephemeral=True)
-            return
+        async with self._lock:
+            if interaction.user.id in self.locked_out:
+                await interaction.response.send_message(
+                    "You're locked out of this round. Wait for the next one.", ephemeral=True
+                )
+                return
+            if self.finished.is_set():
+                await interaction.response.send_message("Too late — round's over.", ephemeral=True)
+                return
 
-        if choice == self.correct:
-            self.winner_id = interaction.user.id
-            await interaction.response.send_message("✅ You got it first!", ephemeral=True)
-            for child in self.children:
-                child.disabled = True
-            try:
-                await interaction.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-            self.finished.set()
-        else:
-            self.locked_out.add(interaction.user.id)
-            await interaction.response.send_message(
-                f"❌ Wrong — you're out for this round.", ephemeral=True
-            )
-            # If everyone is locked out, end the round
-            if self.locked_out >= self.player_ids:
+            if choice == self.correct:
+                self.winner_id = interaction.user.id
+                await interaction.response.send_message("✅ You got it first!", ephemeral=True)
+                for child in self.children:
+                    child.disabled = True
+                try:
+                    await interaction.message.edit(view=self)
+                except discord.HTTPException:
+                    pass
                 self.finished.set()
+            else:
+                self.locked_out.add(interaction.user.id)
+                await interaction.response.send_message(
+                    "❌ Wrong — you're out for this round.", ephemeral=True
+                )
+                # If everyone is locked out, end the round
+                if self.locked_out >= self.player_ids:
+                    self.finished.set()
 
     @discord.ui.button(label="Higher ⬆", style=discord.ButtonStyle.success)
     async def higher(self, interaction, _): await self._click(interaction, "higher")
@@ -213,27 +217,40 @@ async def start_multi(thread, players, bot):
         right_term, right_score = random.choice(candidates)
         correct = "higher" if right_score > left_score else "lower"
 
-        scoreboard = " | ".join(f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids)
-        view = _MPHoLView(player_ids, correct)
-        await thread.send(
-            f"**Round {round_num}/{MP_ROUNDS}** — {scoreboard}\n"
-            f"**{left_term}** → score **{left_score}**\n"
-            f"**{right_term}** → score **???**",
-            view=view,
-        )
         try:
-            await _aio.wait_for(view.finished.wait(), timeout=MP_ROUND_TIMEOUT)
-        except _aio.TimeoutError:
-            pass
-
-        if view.winner_id is not None:
-            scores[view.winner_id] += 1
-            winner = players_by_id[view.winner_id]
-            await thread.send(
-                f"`{right_term}` was **{right_score}** — **{winner.display_name}** scores!"
+            scoreboard = " | ".join(
+                f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids
             )
-        else:
-            await thread.send(f"`{right_term}` was **{right_score}** — no one got it.")
+            view = _MPHoLView(player_ids, correct)
+            await thread.send(
+                f"**Round {round_num}/{MP_ROUNDS}** — {scoreboard}\n"
+                f"**{left_term}** → score **{left_score}**\n"
+                f"**{right_term}** → score **???**",
+                view=view,
+            )
+            try:
+                await _aio.wait_for(view.finished.wait(), timeout=MP_ROUND_TIMEOUT)
+            except _aio.TimeoutError:
+                pass
+
+            async with view._lock:
+                view.finished.set()
+                round_winner_id = view.winner_id
+
+            if round_winner_id is not None:
+                scores[round_winner_id] += 1
+                winner = players_by_id[round_winner_id]
+                await thread.send(
+                    f"`{right_term}` was **{right_score}** — **{winner.display_name}** scores!"
+                )
+            else:
+                await thread.send(f"`{right_term}` was **{right_score}** — no one got it.")
+        except Exception as e:
+            print(f"[higher_or_lower MP] round {round_num} error: {e!r}")
+            try:
+                await thread.send(f"⚠️ Round {round_num} hit a snag — skipping ahead.")
+            except discord.HTTPException:
+                pass
 
         left_term, left_score = right_term, right_score
 

@@ -236,6 +236,10 @@ async def start_multi(thread, players, bot):
     try:
         await asyncio.wait_for(game.finished.wait(), timeout=MP_INACTIVITY_TIMEOUT)
     except asyncio.TimeoutError:
+        # Close the game so any in-flight/late guess is cleanly rejected
+        # instead of processing after we've already announced time-out.
+        async with game._lock:
+            game.finished.set()
         await thread.send(
             f"⏱ Round timed out. The word was **{answer.upper()}**."
         )

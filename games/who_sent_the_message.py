@@ -155,7 +155,9 @@ class _WSMGuessModal(discord.ui.Modal, title="Who sent it?"):
 
 class _MPWSMView(discord.ui.View):
     def __init__(self, player_ids: set[int], valid: set[str]):
-        super().__init__(timeout=MP_ROUND_TIMEOUT)
+        # Outlive the round so late clicks get a friendly message instead of
+        # Discord's generic "interaction failed".
+        super().__init__(timeout=MP_ROUND_TIMEOUT + 20)
         self.player_ids = player_ids
         self.valid = valid
         self.attempts: dict[int, int] = {}
@@ -231,31 +233,44 @@ async def start_multi(thread, players, bot):
     )
 
     for i, msg in enumerate(chosen_messages, 1):
-        correct = msg.author
-        valid = _valid_names(correct) if isinstance(correct, discord.Member) else {_normalize(correct.name)}
-        valid.discard("")
-
-        content = msg.content
-        if len(content) > 1000:
-            content = content[:1000] + "…"
-
-        scoreboard = " | ".join(f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids)
-        view = _MPWSMView(player_ids, valid)
-        await thread.send(
-            f"**Round {i}/{rounds_to_play}** — {scoreboard}\n> {content}",
-            view=view,
-        )
         try:
-            await asyncio.wait_for(view.finished.wait(), timeout=MP_ROUND_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
+            correct = msg.author
+            valid = _valid_names(correct) if isinstance(correct, discord.Member) else {_normalize(correct.name)}
+            valid.discard("")
 
-        if view.winner_id is not None:
-            scores[view.winner_id] += 1
-            winner = players_by_id[view.winner_id]
-            await thread.send(f"✅ **{winner.display_name}** got it! It was **{correct.display_name}**.")
-        else:
-            await thread.send(f"⏱ No one got it. It was **{correct.display_name}**.")
+            content = msg.content
+            if len(content) > 1000:
+                content = content[:1000] + "…"
+
+            scoreboard = " | ".join(
+                f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids
+            )
+            view = _MPWSMView(player_ids, valid)
+            await thread.send(
+                f"**Round {i}/{rounds_to_play}** — {scoreboard}\n> {content}",
+                view=view,
+            )
+            try:
+                await asyncio.wait_for(view.finished.wait(), timeout=MP_ROUND_TIMEOUT)
+            except asyncio.TimeoutError:
+                pass
+
+            async with view._lock:
+                view.finished.set()
+                round_winner_id = view.winner_id
+
+            if round_winner_id is not None:
+                scores[round_winner_id] += 1
+                winner = players_by_id[round_winner_id]
+                await thread.send(f"✅ **{winner.display_name}** got it! It was **{correct.display_name}**.")
+            else:
+                await thread.send(f"⏱ No one got it. It was **{correct.display_name}**.")
+        except Exception as e:
+            print(f"[who_sent_the_message MP] round {i} error: {e!r}")
+            try:
+                await thread.send(f"⚠️ Round {i} hit a snag — skipping ahead.")
+            except discord.HTTPException:
+                pass
 
         if i < rounds_to_play:
             await asyncio.sleep(INTERMISSION)

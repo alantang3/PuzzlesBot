@@ -124,12 +124,15 @@ class _MPTriviaButton(discord.ui.Button):
 
 class _MPTriviaView(discord.ui.View):
     def __init__(self, player_ids: set[int], options: list[str], correct: str):
-        super().__init__(timeout=MP_ROUND_TIMEOUT)
+        # Outlive the round so late clicks get a friendly message instead of
+        # Discord's generic "interaction failed".
+        super().__init__(timeout=MP_ROUND_TIMEOUT + 20)
         self.player_ids = player_ids
         self.correct = correct
         self.locked_out: set[int] = set()
         self.winner_id: int | None = None
         self.finished = asyncio.Event()
+        self._lock = asyncio.Lock()
         for i, opt in enumerate(options):
             self.add_item(_MPTriviaButton(opt, i))
 
@@ -137,26 +140,27 @@ class _MPTriviaView(discord.ui.View):
         if interaction.user.id not in self.player_ids:
             await interaction.response.send_message("You're not in this game.", ephemeral=True)
             return
-        if interaction.user.id in self.locked_out:
-            await interaction.response.send_message("You're locked out of this question.", ephemeral=True)
-            return
-        if self.finished.is_set():
-            await interaction.response.send_message("Too late — someone got it.", ephemeral=True)
-            return
+        async with self._lock:
+            if interaction.user.id in self.locked_out:
+                await interaction.response.send_message("You're locked out of this question.", ephemeral=True)
+                return
+            if self.finished.is_set():
+                await interaction.response.send_message("Too late — round's over.", ephemeral=True)
+                return
 
-        if value == self.correct:
-            self.winner_id = interaction.user.id
-            for child in self.children:
-                child.disabled = True
-                if isinstance(child, _MPTriviaButton) and child.value == self.correct:
-                    child.style = discord.ButtonStyle.success
-            await interaction.response.edit_message(view=self)
-            self.finished.set()
-        else:
-            self.locked_out.add(interaction.user.id)
-            await interaction.response.send_message("❌ Wrong — you're out for this question.", ephemeral=True)
-            if self.locked_out >= self.player_ids:
+            if value == self.correct:
+                self.winner_id = interaction.user.id
+                for child in self.children:
+                    child.disabled = True
+                    if isinstance(child, _MPTriviaButton) and child.value == self.correct:
+                        child.style = discord.ButtonStyle.success
+                await interaction.response.edit_message(view=self)
                 self.finished.set()
+            else:
+                self.locked_out.add(interaction.user.id)
+                await interaction.response.send_message("❌ Wrong — you're out for this question.", ephemeral=True)
+                if self.locked_out >= self.player_ids:
+                    self.finished.set()
 
 
 async def start_multi(thread, players, bot):
@@ -179,30 +183,43 @@ async def start_multi(thread, players, bot):
     )
 
     for i, q in enumerate(questions, 1):
-        question = html.unescape(q["question"])
-        correct = html.unescape(q["correct_answer"])
-        wrongs = [html.unescape(a) for a in q["incorrect_answers"]]
-        options = wrongs + [correct]
-        random.shuffle(options)
-
-        scoreboard = " | ".join(f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids)
-        view = _MPTriviaView(player_ids, options, correct)
-        difficulty = q.get("difficulty", "?").capitalize()
-        await thread.send(
-            f"**Q{i}/{total}** _({difficulty})_ — {scoreboard}\n{question}",
-            view=view,
-        )
         try:
-            await asyncio.wait_for(view.finished.wait(), timeout=MP_ROUND_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
+            question = html.unescape(q["question"])
+            correct = html.unescape(q["correct_answer"])
+            wrongs = [html.unescape(a) for a in q["incorrect_answers"]]
+            options = wrongs + [correct]
+            random.shuffle(options)
 
-        if view.winner_id is not None:
-            scores[view.winner_id] += 1
-            winner = players_by_id[view.winner_id]
-            await thread.send(f"✅ **{winner.display_name}** got it! Correct answer: **{correct}**.")
-        else:
-            await thread.send(f"⏱ No one got it. Correct answer: **{correct}**.")
+            scoreboard = " | ".join(
+                f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids
+            )
+            view = _MPTriviaView(player_ids, options, correct)
+            difficulty = q.get("difficulty", "?").capitalize()
+            await thread.send(
+                f"**Q{i}/{total}** _({difficulty})_ — {scoreboard}\n{question}",
+                view=view,
+            )
+            try:
+                await asyncio.wait_for(view.finished.wait(), timeout=MP_ROUND_TIMEOUT)
+            except asyncio.TimeoutError:
+                pass
+
+            async with view._lock:
+                view.finished.set()
+                round_winner_id = view.winner_id
+
+            if round_winner_id is not None:
+                scores[round_winner_id] += 1
+                winner = players_by_id[round_winner_id]
+                await thread.send(f"✅ **{winner.display_name}** got it! Correct answer: **{correct}**.")
+            else:
+                await thread.send(f"⏱ No one got it. Correct answer: **{correct}**.")
+        except Exception as e:
+            print(f"[sports_trivia MP] question {i} error: {e!r}")
+            try:
+                await thread.send(f"⚠️ Question {i} hit a snag — skipping ahead.")
+            except discord.HTTPException:
+                pass
 
         if i < total:
             await asyncio.sleep(INTERMISSION)
