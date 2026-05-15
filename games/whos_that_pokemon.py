@@ -168,7 +168,9 @@ class _PokemonGuessModal(discord.ui.Modal, title="Who's that Pokémon?"):
 
 class _MPPokemonView(discord.ui.View):
     def __init__(self, player_ids: set[int], target: str):
-        super().__init__(timeout=MP_ROUND_TIMEOUT)
+        # View lives a bit longer than the round so late clicks get a friendly
+        # "round's over" instead of Discord's generic "interaction failed".
+        super().__init__(timeout=MP_ROUND_TIMEOUT + 20)
         self.player_ids = player_ids
         self.target = target  # normalized
         self.attempts: dict[int, int] = {}
@@ -258,14 +260,20 @@ async def start_multi(thread, players, bot):
             except asyncio.TimeoutError:
                 pass
 
+            # Atomically close the round so any in-flight/late modal submit is
+            # rejected with "round's over" instead of scoring after we moved on.
+            async with view._lock:
+                view.finished.set()
+                round_winner_id = view.winner_id
+
             reveal = discord.Embed(title=f"It was {name.title()}.")
             reveal.set_image(url=sprite_url)
-            if view.winner_id is not None:
-                scores[view.winner_id] += 1
-                winner = players_by_id[view.winner_id]
+            if round_winner_id is not None:
+                scores[round_winner_id] += 1
+                winner = players_by_id[round_winner_id]
                 await thread.send(f"✅ **{winner.display_name}** got it!", embed=reveal)
             else:
-                await thread.send(f"⏱ No one got it.", embed=reveal)
+                await thread.send("⏱ No one got it.", embed=reveal)
 
             if round_num < ROUNDS:
                 await asyncio.sleep(INTERMISSION)

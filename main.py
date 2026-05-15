@@ -28,6 +28,10 @@ _game_cmd_last_used: dict[int, float] = {}
 
 intents: Intents = Intents.default()
 intents.message_content = True
+# Required for multiplayer: thread.fetch_members() / member lookups need the
+# Server Members privileged intent. Must ALSO be toggled on in the Discord
+# Developer Portal (Bot tab → Privileged Gateway Intents → Server Members).
+intents.members = True
 # Block @everyone, @here, role pings, and arbitrary user pings from any bot message.
 # Replies still ping the replied-to user. Prevents mass-mention injection via games like
 # Who Sent the Message or the "i'm" easter egg.
