@@ -50,17 +50,33 @@ def _make_silhouette(image_bytes: bytes) -> io.BytesIO:
     return buf
 
 
-async def _pick_pokemon(session: aiohttp.ClientSession) -> dict | None:
-    """Pick a random Pokémon that actually has a usable front sprite."""
-    for _ in range(5):  # retry a few times if a Pokémon has no sprite
+async def _prepare_round(session: aiohttp.ClientSession, attempts: int = 10):
+    """Pick a Pokémon, fetch its sprite, and build a silhouette — retrying with a
+    different Pokémon if any step fails (bad/empty/non-image bytes). Returns
+    (pokemon_data, silhouette_BytesIO) or None if every attempt failed.
+    Raises RuntimeError only if Pillow itself is missing."""
+    for _ in range(attempts):
         pid = random.randint(1, MAX_POKEMON_ID)
         try:
             data = await _fetch_pokemon(session, pid)
         except Exception:
             continue
-        sprite = data.get("sprites", {}).get("front_default")
-        if sprite:
-            return data
+        sprite_url = (data.get("sprites") or {}).get("front_default")
+        if not sprite_url:
+            continue
+        try:
+            sprite_bytes = await _fetch_sprite(session, sprite_url)
+        except Exception:
+            continue
+        if not sprite_bytes or len(sprite_bytes) < 100:
+            continue  # empty or implausibly tiny — not a real sprite
+        try:
+            silhouette = _make_silhouette(sprite_bytes)
+        except RuntimeError:
+            raise  # Pillow not installed — no point retrying
+        except Exception:
+            continue  # unidentifiable/corrupt image — try a different Pokémon
+        return data, silhouette
     return None
 
 
@@ -82,21 +98,19 @@ async def start(thread, user, bot):
 
     async with aiohttp.ClientSession() as session:
         for round_num in range(1, ROUNDS + 1):
-            pokemon = await _pick_pokemon(session)
-            if pokemon is None:
-                await thread.send("Couldn't reach PokéAPI right now. Round cancelled.")
+            try:
+                prepared = await _prepare_round(session)
+            except RuntimeError:
+                await thread.send("Pillow isn't installed on the host — `pip install pillow`.")
+                return
+            if prepared is None:
+                await thread.send("Couldn't get a usable Pokémon image after several tries. Round cancelled.")
                 break
 
+            pokemon, silhouette = prepared
             name = pokemon["name"]
             sprite_url = pokemon["sprites"]["front_default"]
             normalized_target = _normalize(name)
-
-            try:
-                sprite_bytes = await _fetch_sprite(session, sprite_url)
-                silhouette = _make_silhouette(sprite_bytes)
-            except Exception as e:
-                await thread.send(f"Image error: `{e}`. Round cancelled.")
-                break
 
             embed = discord.Embed(title=f"Round {round_num}/{ROUNDS}", description="Who's that Pokémon?")
             embed.set_image(url="attachment://silhouette.png")
@@ -233,21 +247,19 @@ async def start_multi(thread, players, bot):
 
     async with aiohttp.ClientSession() as session:
         for round_num in range(1, ROUNDS + 1):
-            pokemon = await _pick_pokemon(session)
-            if pokemon is None:
-                await thread.send("Couldn't reach PokéAPI. Stopping.")
+            try:
+                prepared = await _prepare_round(session)
+            except RuntimeError:
+                await thread.send("Pillow isn't installed on the host — `pip install pillow`.")
+                return
+            if prepared is None:
+                await thread.send("Couldn't get a usable Pokémon image after several tries. Stopping.")
                 break
 
+            pokemon, silhouette = prepared
             name = pokemon["name"]
             sprite_url = pokemon["sprites"]["front_default"]
             normalized_target = _normalize(name)
-
-            try:
-                sprite_bytes = await _fetch_sprite(session, sprite_url)
-                silhouette = _make_silhouette(sprite_bytes)
-            except Exception as e:
-                await thread.send(f"Image error: `{e}`. Stopping.")
-                break
 
             scoreboard = " | ".join(f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids)
             embed = discord.Embed(title=f"Round {round_num}/{ROUNDS}", description="Who's that Pokémon?")
