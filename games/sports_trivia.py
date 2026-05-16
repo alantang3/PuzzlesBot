@@ -1,15 +1,24 @@
 import asyncio
 import html
+import json
+import os
 import random
+from pathlib import Path
 
 import aiohttp
 import discord
 
-CATEGORY_ID = 21  # Open Trivia DB "Sports" category
 NUM_QUESTIONS = 10
 QUESTION_TIMEOUT = 25
-API_URL = "https://opentdb.com/api.php"
+API_URL = "https://the-trivia-api.com/v2/questions"
+TRIVIA_CATEGORY = "sport_and_leisure"  # The Trivia API sports category
 INTERMISSION = 2.5  # seconds between questions
+
+# Growing, deduplicated local question bank. The API only seeds it; every
+# fetch tops it up with questions not already stored. Matches the data/
+# JSON convention used by cryptograms.
+BANK_PATH = Path(__file__).resolve().parent / "data" / "sports_trivia.json"
+_BANK_LOCK = asyncio.Lock()  # serialise read-merge-write across concurrent games
 
 
 class TriviaView(discord.ui.View):
@@ -52,14 +61,102 @@ class _OptionButton(discord.ui.Button):
         await view.resolve(interaction, self.value)
 
 
-async def _fetch_questions(amount: int) -> list[dict]:
-    params = {"amount": amount, "category": CATEGORY_ID, "type": "multiple"}
+def _dedup_key(q: dict) -> str:
+    """Stable identity for a question. Prefer the API's own id; fall back to
+    the normalised prompt text so older/keyless entries still dedupe."""
+    qid = q.get("id")
+    if qid:
+        return f"id:{qid}"
+    return "q:" + " ".join(str(q.get("question", "")).lower().split())
+
+
+def _load_bank() -> list[dict]:
+    try:
+        with open(BANK_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("questions", []) if isinstance(data, dict) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_bank(questions: list[dict]) -> None:
+    BANK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = BANK_PATH.parent / (BANK_PATH.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"questions": questions}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, BANK_PATH)  # atomic: never leaves a half-written bank
+
+
+async def _fetch_from_api(amount: int) -> list[dict]:
+    params = {"categories": TRIVIA_CATEGORY, "limit": amount}
     async with aiohttp.ClientSession() as session:
         async with session.get(API_URL, params=params, timeout=15) as resp:
+            resp.raise_for_status()
             data = await resp.json()
-    if data.get("response_code") != 0 or not data.get("results"):
-        raise RuntimeError("Open Trivia DB returned no results")
-    return data["results"]
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("The Trivia API returned no results")
+
+    # Normalise v2 shape into the internal dict the game loops expect.
+    # (v2 nests the prompt under question.text; v1 used a plain string.)
+    questions: list[dict] = []
+    for item in data:
+        q = item.get("question")
+        text = q.get("text") if isinstance(q, dict) else q
+        correct = item.get("correctAnswer")
+        wrongs = item.get("incorrectAnswers") or []
+        if not text or correct is None or not wrongs:
+            continue
+        questions.append({
+            "id": item.get("id"),
+            "question": text,
+            "correct_answer": correct,
+            "incorrect_answers": list(wrongs),
+            "difficulty": item.get("difficulty", "?"),
+        })
+    return questions
+
+
+async def _refresh_bank(amount: int) -> list[dict]:
+    """Fetch from the API and merge any new, non-duplicate questions into the
+    JSON bank. Returns the full bank. If the API is unreachable, fall back to
+    whatever is already banked instead of failing the game."""
+    async with _BANK_LOCK:
+        bank = _load_bank()
+        seen = {_dedup_key(q) for q in bank}
+        try:
+            fetched = await _fetch_from_api(amount)
+        except Exception as e:
+            if bank:
+                print(f"[sports_trivia] API fetch failed ({e!r}); "
+                      f"using {len(bank)} banked questions")
+                return bank
+            raise
+
+        added = 0
+        for q in fetched:
+            key = _dedup_key(q)
+            if key in seen:
+                continue
+            seen.add(key)
+            bank.append(q)
+            added += 1
+        if added:
+            _save_bank(bank)
+            print(f"[sports_trivia] bank +{added} new question(s) "
+                  f"(total {len(bank)})")
+        return bank
+
+
+async def _fetch_questions(amount: int) -> list[dict]:
+    """Top up the bank from the API, then draw this game's questions from the
+    accumulated bank. Same signature/contract as before, so the game loops
+    are unchanged."""
+    bank = await _refresh_bank(amount)
+    if not bank:
+        raise RuntimeError("No trivia questions available")
+    pool = bank[:]
+    random.shuffle(pool)
+    return pool[:amount]
 
 
 async def start(thread, user, bot):

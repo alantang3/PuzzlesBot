@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import random
 import re
 
@@ -10,7 +11,13 @@ INTERMISSION = 2.5
 MAX_GUESSES = 2
 MIN_LEN = 15
 MAX_LEN = 500
-LIMIT_PER_CHANNEL = 100  # how far back to read per channel
+# Instead of only the most recent N messages, sample several random windows
+# across each channel's whole timeline so old/forgotten messages can surface.
+# Reads run concurrently but bounded, so a many-channel server stays fast
+# without saturating Discord's shared global rate limit.
+HISTORY_WINDOW = 100   # messages per window (1 API page = 1 request)
+SAMPLE_WINDOWS = 5     # random time windows per channel, plus the most-recent one
+READ_CONCURRENCY = 8   # max history reads in flight at once
 MIN_AUTHORS = 4  # need at least this many distinct senders worth of variety
 
 
@@ -20,26 +27,60 @@ def _normalize(text: str | None) -> str:
 
 
 async def _build_pool(guild: discord.Guild, exclude_channel_ids: set[int]) -> list[discord.Message]:
-    """Pull recent eligible messages from every text channel the bot can read."""
-    pool: list[discord.Message] = []
+    """Sample eligible messages from across each readable channel's whole
+    timeline (recent window + several random historical windows), so old or
+    forgotten messages can surface. Reads run concurrently, bounded by a
+    semaphore so the burst never saturates the bot's global rate limit."""
+    now = discord.utils.utcnow()
+    sem = asyncio.Semaphore(READ_CONCURRENCY)
+
+    async def _read_window(channel: discord.TextChannel,
+                           before: datetime.datetime | None) -> list[discord.Message]:
+        out: list[discord.Message] = []
+        async with sem:
+            try:
+                async for msg in channel.history(limit=HISTORY_WINDOW, before=before):
+                    if msg.author.bot or msg.is_system():
+                        continue
+                    content = (msg.content or "").strip()
+                    if not (MIN_LEN <= len(content) <= MAX_LEN):
+                        continue
+                    if content.startswith(("http://", "https://", "/", "!")):
+                        continue
+                    out.append(msg)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        return out
+
+    tasks: list[asyncio.Task] = []
     for channel in guild.text_channels:
         if channel.id in exclude_channel_ids:
             continue
         perms = channel.permissions_for(guild.me)
         if not (perms.read_message_history and perms.view_channel):
             continue
-        try:
-            async for msg in channel.history(limit=LIMIT_PER_CHANNEL):
-                if msg.author.bot or msg.is_system():
-                    continue
-                content = (msg.content or "").strip()
-                if not (MIN_LEN <= len(content) <= MAX_LEN):
-                    continue
-                if content.startswith(("http://", "https://", "/", "!")):
-                    continue
-                pool.append(msg)
-        except (discord.Forbidden, discord.HTTPException):
-            continue
+
+        created = channel.created_at or now
+        span = (now - created).total_seconds()
+        # Always include the most-recent window; add random anchors across the
+        # channel's life so any era can show up.
+        anchors: list[datetime.datetime | None] = [None]
+        for _ in range(SAMPLE_WINDOWS):
+            if span <= 0:
+                break
+            anchors.append(created + datetime.timedelta(seconds=random.uniform(0, span)))
+
+        for before in anchors:
+            tasks.append(asyncio.create_task(_read_window(channel, before)))
+
+    pool: list[discord.Message] = []
+    seen_ids: set[int] = set()
+    for window in await asyncio.gather(*tasks):
+        for msg in window:
+            if msg.id in seen_ids:
+                continue
+            seen_ids.add(msg.id)
+            pool.append(msg)
     return pool
 
 
