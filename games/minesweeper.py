@@ -1,6 +1,9 @@
+import asyncio
+import copy
 import io
 import math
 import random
+import time
 
 import discord
 from PIL import Image, ImageDraw, ImageFont
@@ -423,3 +426,245 @@ async def start(thread, user, bot):
     file = discord.File(_render_image(view.board), filename="board.png")
     view.message = await thread.send(embed=view._embed(), file=file, view=view)
     await view.wait()
+
+
+# -----------------------------------------------------------------------------
+# Multiplayer race — same board, private per-player copy (cryptograms model)
+# -----------------------------------------------------------------------------
+
+MP_TIMEOUT = 1200  # seconds for the race (20 min)
+
+
+def _fmt(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s}s" if m else f"{s}s"
+
+
+def _seed_open(board: list[list[dict]]) -> None:
+    """Pre-reveal one safe area, identical for everyone. Replaces per-player
+    first-click safety (which would make each player's board differ and break
+    a fair shared-board race)."""
+    zeros = [
+        (r, c) for r in range(ROWS) for c in range(COLS)
+        if not board[r][c]["is_mine"] and board[r][c]["adj"] == 0
+    ]
+    if zeros:
+        r, c = random.choice(zeros)
+    else:
+        safe = [
+            (r, c) for r in range(ROWS) for c in range(COLS)
+            if not board[r][c]["is_mine"]
+        ]
+        r, c = random.choice(safe)
+    _reveal(board, r, c)
+
+
+class _MPMineGame:
+    def __init__(self, thread, players, base_board):
+        self.thread = thread
+        self.players_by_id = {p.id: p for p in players}
+        self.player_ids = set(self.players_by_id)
+        self.boards = {pid: copy.deepcopy(base_board) for pid in self.player_ids}
+        self.dead: set[int] = set()
+        self.winner_id: int | None = None
+        self.finished = asyncio.Event()
+        self.started = time.monotonic()
+        self._lock = asyncio.Lock()
+
+
+class _MPBoardView(discord.ui.View):
+    """A player's own private ephemeral board. Reuses the single-player
+    Row/Col selects and action/flag buttons via the same attribute interface."""
+
+    def __init__(self, game: _MPMineGame, pid: int):
+        super().__init__(timeout=MP_TIMEOUT)
+        self.game = game
+        self.pid = pid
+        self.board = game.boards[pid]
+        self.sel_row: int | None = None
+        self.sel_col: int | None = None
+        self.flag_mode = False
+        self.row_select = _RowSelect()
+        self.col_select = _ColSelect()
+        self.flag_button = _FlagButton()
+        self.add_item(self.row_select)
+        self.add_item(self.col_select)
+        self.add_item(_ActionButton())
+        self.add_item(self.flag_button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.pid:
+            await interaction.response.send_message(
+                "This isn't your board.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _embed(self) -> discord.Embed:
+        g = self.game
+        alive = len(g.player_ids) - len(g.dead)
+        mode = "🚩 Flag" if self.flag_mode else "✅ Reveal"
+        embed = discord.Embed(title="💣 Minesweeper Race", color=0x5865F2)
+        embed.description = (
+            f"Your private board · Mode **{mode}** · "
+            f"Flags **{_count_flags(self.board)}**\n"
+            f"Players still in: **{alive}/{len(g.player_ids)}**\n"
+            f"Pick a **row** and **column**, then press the action button."
+        )
+        embed.set_image(url="attachment://board.png")
+        return embed
+
+    def _disable(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+    async def _refresh(self, interaction: discord.Interaction, *,
+                       reveal_mines: bool = False) -> None:
+        file = discord.File(
+            _render_image(self.board, reveal_mines=reveal_mines), filename="board.png"
+        )
+        await interaction.response.edit_message(
+            embed=self._embed(), attachments=[file], view=self
+        )
+
+    async def toggle_flag(self, interaction: discord.Interaction,
+                          button: _FlagButton) -> None:
+        self.flag_mode = not self.flag_mode
+        button.label = f"Flag mode: {'ON' if self.flag_mode else 'OFF'}"
+        button.style = (
+            discord.ButtonStyle.primary if self.flag_mode
+            else discord.ButtonStyle.secondary
+        )
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    async def do_action(self, interaction: discord.Interaction) -> None:
+        g = self.game
+        if g.finished.is_set():
+            await interaction.response.send_message(
+                "This race is over.", ephemeral=True
+            )
+            return
+        if self.sel_row is None or self.sel_col is None:
+            await interaction.response.send_message(
+                "Pick a row **and** a column first.", ephemeral=True
+            )
+            return
+
+        r, c = self.sel_row, self.sel_col
+        cell = self.board[r][c]
+
+        if self.flag_mode:
+            if cell["revealed"]:
+                await interaction.response.send_message(
+                    "Can't flag a revealed cell.", ephemeral=True
+                )
+                return
+            cell["flagged"] = not cell["flagged"]
+            await self._refresh(interaction)
+            return
+
+        if cell["flagged"]:
+            await interaction.response.send_message(
+                "That cell is flagged — switch to Flag mode to unflag it first.",
+                ephemeral=True,
+            )
+            return
+        if cell["revealed"]:
+            await interaction.response.send_message(
+                "Already revealed.", ephemeral=True
+            )
+            return
+
+        if _reveal(self.board, r, c):
+            async with g._lock:
+                g.dead.add(self.pid)
+                all_out = g.dead >= g.player_ids and g.winner_id is None
+            self._disable()
+            await self._refresh(interaction, reveal_mines=True)
+            await g.thread.send(
+                f"💥 **{g.players_by_id[self.pid].display_name}** hit a mine "
+                f"and is out!"
+            )
+            if all_out and not g.finished.is_set():
+                g.finished.set()
+            self.stop()
+            return
+
+        if _is_won(self.board):
+            async with g._lock:
+                first = g.winner_id is None
+                if first:
+                    g.winner_id = self.pid
+            self._disable()
+            await self._refresh(interaction, reveal_mines=True)
+            if first:
+                g.finished.set()
+            self.stop()
+            return
+
+        await self._refresh(interaction)
+
+
+class _MPLauncher(discord.ui.View):
+    def __init__(self, game: _MPMineGame):
+        super().__init__(timeout=MP_TIMEOUT)
+        self.game = game
+
+    @discord.ui.button(label="Open my board", style=discord.ButtonStyle.primary, emoji="📝")
+    async def open_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        g = self.game
+        if interaction.user.id not in g.player_ids:
+            await interaction.response.send_message(
+                "👀 You're spectating — only lobby players can play.",
+                ephemeral=True,
+            )
+            return
+        if g.finished.is_set():
+            await interaction.response.send_message(
+                "This race is over.", ephemeral=True
+            )
+            return
+        if interaction.user.id in g.dead:
+            await interaction.response.send_message(
+                "💥 You're out — you hit a mine.", ephemeral=True
+            )
+            return
+        view = _MPBoardView(g, interaction.user.id)
+        file = discord.File(
+            _render_image(g.boards[interaction.user.id]), filename="board.png"
+        )
+        await interaction.response.send_message(
+            embed=view._embed(), file=file, view=view, ephemeral=True
+        )
+
+
+async def start_multi(thread, players, bot):
+    base = _make_board()
+    _seed_open(base)
+    game = _MPMineGame(thread, players, base)
+
+    names = ", ".join(p.display_name for p in players)
+    await thread.send(
+        f"💣 **Minesweeper Race** — {ROWS}×{COLS}, **{NUM_MINES}** mines.\n"
+        f"Same board, everyone plays their **own private copy** — first to "
+        f"clear it wins. Hit a mine and you're out. A safe area is pre-opened "
+        f"for everyone equally. Click **Open my board** (private to you).\n"
+        f"Players: {names}"
+    )
+    await thread.send(view=_MPLauncher(game))
+
+    try:
+        await asyncio.wait_for(game.finished.wait(), timeout=MP_TIMEOUT)
+    except asyncio.TimeoutError:
+        await thread.send("⏱ Time's up — nobody cleared the board.")
+        return
+
+    winner = game.players_by_id.get(game.winner_id)
+    if winner is not None:
+        elapsed = _fmt(time.monotonic() - game.started)
+        await thread.send(
+            f"🏆 **{winner.display_name}** cleared the board first in "
+            f"**{elapsed}**! 🎉"
+        )
+    else:
+        await thread.send("💥 Everyone hit a mine — no winner this round.")
