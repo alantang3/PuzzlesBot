@@ -11,7 +11,8 @@ WORDS_PATH = Path(__file__).resolve().parent / "data" / "impostor_words.json"
 
 REVEAL_TIMEOUT = 60        # seconds for everyone to peek at their word
 CLUE_TIMEOUT = 45          # seconds per player to give their clue
-CLUE_ROUNDS = 1            # clues per player (tunable)
+MAX_CLUE_ROUNDS = 5        # after each round players may go again, up to this
+CONTINUE_TIMEOUT = 30      # seconds to choose "another round" vs "vote"
 VOTE_TIMEOUT = 60          # seconds for the vote
 IMPOSTOR_GUESS_TIMEOUT = 45  # seconds for the caught impostor's one guess
 
@@ -114,6 +115,43 @@ class _VoteView(discord.ui.View):
             self.stop()
 
 
+class _ContinueView(discord.ui.View):
+    """After a clue round: any player can choose another round or the vote.
+    First valid click decides; defaults to voting if nobody picks in time."""
+
+    def __init__(self, player_ids: set[int]):
+        super().__init__(timeout=CONTINUE_TIMEOUT)
+        self.player_ids = player_ids
+        self.choice: str | None = None  # "again" or "vote"
+        self.done = asyncio.Event()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id not in self.player_ids:
+            await interaction.response.send_message(
+                "You're not in this game.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Another clue round", style=discord.ButtonStyle.primary, emoji="🔁")
+    async def again_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.choice = "again"
+        await interaction.response.send_message(
+            "🔁 Another clue round it is.", ephemeral=True
+        )
+        self.done.set()
+        self.stop()
+
+    @discord.ui.button(label="Go to vote", style=discord.ButtonStyle.success, emoji="🗳️")
+    async def vote_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.choice = "vote"
+        await interaction.response.send_message(
+            "🗳️ Heading to the vote.", ephemeral=True
+        )
+        self.done.set()
+        self.stop()
+
+
 # -----------------------------------------------------------------------------
 # Game
 # -----------------------------------------------------------------------------
@@ -169,17 +207,21 @@ async def start_multi(thread, players, bot):
             f"on: {', '.join(m.display_name for m in missing)}"
         )
 
-    # --- Clue phase: each player, in random order, gives a clue ---
-    order = random.sample(players, len(players))
+    # --- Clue phase: each player gives a clue; after each round players
+    # choose to go again (gather more info) or move to the vote ---
+    player_ids = {p.id for p in players}
     await thread.send(
         f"**Clue phase** — when it's your turn, send **one word** describing "
-        f"your secret word. {CLUE_TIMEOUT}s per turn."
-        + (f" ({CLUE_ROUNDS} rounds.)" if CLUE_ROUNDS > 1 else "")
+        f"your secret word ({CLUE_TIMEOUT}s per turn). After each round you can "
+        f"take **another round** or **go to the vote** "
+        f"(up to {MAX_CLUE_ROUNDS} rounds)."
     )
 
-    for rnd in range(1, CLUE_ROUNDS + 1):
-        if CLUE_ROUNDS > 1:
-            await thread.send(f"**— Clue round {rnd}/{CLUE_ROUNDS} —**")
+    round_num = 0
+    while True:
+        round_num += 1
+        order = random.sample(players, len(players))
+        await thread.send(f"**— Clue round {round_num} —**")
         for p in order:
             await thread.send(f"{p.mention}, your clue? ({CLUE_TIMEOUT}s)")
 
@@ -194,6 +236,33 @@ async def start_multi(thread, players, bot):
                 await bot.wait_for("message", check=_is_clue, timeout=CLUE_TIMEOUT)
             except asyncio.TimeoutError:
                 await thread.send(f"⏱ {p.display_name} didn't give a clue.")
+
+        if round_num >= MAX_CLUE_ROUNDS:
+            await thread.send(
+                f"Reached the {MAX_CLUE_ROUNDS}-round limit — time to vote."
+            )
+            break
+
+        cont = _ContinueView(player_ids)
+        cont_msg = await thread.send(
+            "Round done — **another clue round**, or **go to the vote**? "
+            f"Anyone can choose; defaults to voting in {CONTINUE_TIMEOUT}s.",
+            view=cont,
+        )
+        try:
+            await asyncio.wait_for(cont.done.wait(), timeout=CONTINUE_TIMEOUT + 5)
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await cont_msg.edit(view=None)
+        except discord.HTTPException:
+            pass
+
+        if cont.choice == "again":
+            await thread.send("🔁 Going again — another clue round!")
+            continue
+        await thread.send("🗳️ Moving to the vote.")
+        break
 
     # --- Vote phase ---
     vote = _VoteView(players)
