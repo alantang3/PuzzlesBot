@@ -309,14 +309,22 @@ async def start_cmd(ctx: commands.Context):
                 break
     finally:
         active_lobbies.pop(ctx.channel.id, None)
+        if bot.is_closed():
+            # Bot is shutting down (Ctrl-C / restart): the HTTP session is
+            # already gone, so skip network cleanup instead of raising a
+            # "Session is closed" cascade through the command error handler.
+            return
         try:
             await ctx.send(f"Closing this lobby in {POST_GAME_DELAY}s.")
-        except discord.HTTPException:
+        except (discord.DiscordException, RuntimeError):
             pass
-        await asyncio.sleep(POST_GAME_DELAY)
+        try:
+            await asyncio.sleep(POST_GAME_DELAY)
+        except asyncio.CancelledError:
+            return
         try:
             await ctx.channel.delete()
-        except discord.HTTPException:
+        except (discord.DiscordException, RuntimeError):
             pass
 
 

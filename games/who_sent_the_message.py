@@ -11,14 +11,16 @@ INTERMISSION = 2.5
 MAX_GUESSES = 2
 MIN_LEN = 15
 MAX_LEN = 500
-# Instead of only the most recent N messages, sample several random windows
-# across each channel's whole timeline so old/forgotten messages can surface.
-# Reads run concurrently but bounded, so a many-channel server stays fast
-# without saturating Discord's shared global rate limit.
-HISTORY_WINDOW = 100   # messages per window (1 API page = 1 request)
-SAMPLE_WINDOWS = 5     # random time windows per channel, plus the most-recent one
+# Sample messages from a fixed number of random "markers". Each marker is a
+# random readable channel + a random point in that channel's history. Cost is
+# the marker count, NOT markers x channels, so it stays flat on big servers
+# while still pulling messages randomly across channels and time.
+HISTORY_WINDOW = 100   # max messages per marker (1 API page = 1 request); fewer is fine
+POOL_MARKERS = 5       # total history reads per game, regardless of server size
 READ_CONCURRENCY = 8   # max history reads in flight at once
-MIN_AUTHORS = 4  # need at least this many distinct senders worth of variety
+# Not a server-size gate: with only 1 distinct sender "guess who sent it" has
+# exactly one answer every round, which isn't a game. 2 is the true minimum.
+MIN_AUTHORS = 2
 
 
 def _normalize(text: str | None) -> str:
@@ -27,15 +29,32 @@ def _normalize(text: str | None) -> str:
 
 
 async def _build_pool(guild: discord.Guild, exclude_channel_ids: set[int]) -> list[discord.Message]:
-    """Sample eligible messages from across each readable channel's whole
-    timeline (recent window + several random historical windows), so old or
-    forgotten messages can surface. Reads run concurrently, bounded by a
-    semaphore so the burst never saturates the bot's global rate limit."""
+    """Collect eligible messages from POOL_MARKERS random markers. Each marker
+    is a random readable channel at a random point in its history, read for up
+    to HISTORY_WINDOW messages (fewer is fine — short/sparse spots just
+    contribute less). Total cost is the marker count, independent of how many
+    channels the server has, while staying random across channels and time."""
     now = discord.utils.utcnow()
+
+    channels: list[discord.TextChannel] = []
+    for ch in guild.text_channels:
+        if ch.id in exclude_channel_ids:
+            continue
+        perms = ch.permissions_for(guild.me)
+        if perms.read_message_history and perms.view_channel:
+            channels.append(ch)
+    if not channels:
+        return []
+
     sem = asyncio.Semaphore(READ_CONCURRENCY)
 
-    async def _read_window(channel: discord.TextChannel,
-                           before: datetime.datetime | None) -> list[discord.Message]:
+    async def _read_marker() -> list[discord.Message]:
+        channel = random.choice(channels)
+        created = channel.created_at or now
+        span = (now - created).total_seconds()
+        before: datetime.datetime | None = None
+        if span > 0:
+            before = created + datetime.timedelta(seconds=random.uniform(0, span))
         out: list[discord.Message] = []
         async with sem:
             try:
@@ -52,31 +71,12 @@ async def _build_pool(guild: discord.Guild, exclude_channel_ids: set[int]) -> li
                 pass
         return out
 
-    tasks: list[asyncio.Task] = []
-    for channel in guild.text_channels:
-        if channel.id in exclude_channel_ids:
-            continue
-        perms = channel.permissions_for(guild.me)
-        if not (perms.read_message_history and perms.view_channel):
-            continue
-
-        created = channel.created_at or now
-        span = (now - created).total_seconds()
-        # Always include the most-recent window; add random anchors across the
-        # channel's life so any era can show up.
-        anchors: list[datetime.datetime | None] = [None]
-        for _ in range(SAMPLE_WINDOWS):
-            if span <= 0:
-                break
-            anchors.append(created + datetime.timedelta(seconds=random.uniform(0, span)))
-
-        for before in anchors:
-            tasks.append(asyncio.create_task(_read_window(channel, before)))
+    results = await asyncio.gather(*[_read_marker() for _ in range(POOL_MARKERS)])
 
     pool: list[discord.Message] = []
     seen_ids: set[int] = set()
-    for window in await asyncio.gather(*tasks):
-        for msg in window:
+    for batch in results:
+        for msg in batch:
             if msg.id in seen_ids:
                 continue
             seen_ids.add(msg.id)
@@ -116,8 +116,9 @@ async def start(thread, user, bot):
 
     if len(authors_by_id) < MIN_AUTHORS:
         await notice.edit(
-            content=f"Only found **{len(authors_by_id)}** different message senders (need at least {MIN_AUTHORS}). "
-                    "Try again later when there's more chat history."
+            content="I need messages from at least two different people to make this "
+                    "a guessing game, but the chat I sampled is too quiet right now. "
+                    "Try again once there's been a bit more conversation."
         )
         return
 
@@ -254,7 +255,10 @@ async def start_multi(thread, players, bot):
         return
     authors_by_id = {m.author.id: m.author for m in pool if isinstance(m.author, discord.Member)}
     if len(authors_by_id) < MIN_AUTHORS:
-        await notice.edit(content=f"Only {len(authors_by_id)} senders found, need {MIN_AUTHORS}.")
+        await notice.edit(
+            content="Need messages from at least two different people to play — "
+                    "the sampled chat is too quiet right now. Try again later."
+        )
         return
 
     rounds_to_play = min(ROUNDS, len(pool))
