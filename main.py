@@ -412,7 +412,13 @@ async def on_message(message: Message) -> None:
         if pick == 1:
             await message.channel.send(f"Hi {name}, I'm Alan Tang, the goat")
         else:
-            await message.channel.send(f"Hi {name}, I'm David Tan, the fraud")
+            fraud = "David Tan"
+            guild = message.guild
+            if guild is not None:
+                candidates = [m for m in guild.members if not m.bot]
+                if candidates:
+                    fraud = random.choice(candidates).display_name
+            await message.channel.send(f"Hi {name}, I'm {fraud}, the fraud")
 
 
 def main() -> None:
