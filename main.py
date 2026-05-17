@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,11 @@ TOKEN: Final[str] = os.getenv("DISCORD_TOKEN")
 LOBBY_TTL = 1200  # auto-delete lobby thread after this many seconds if game never starts
 POST_GAME_DELAY = 30  # seconds to leave the thread open after a game ends
 TRENDS_REFRESH_HOURS = 12
+
+# Dad-joke trigger: "im" / "i'm" / "i’m" as its own word (apostrophe optional),
+# bounded by non-word chars so it won't fire inside "him", "image", "imma".
+# Group 2 is the rest of the message after it (the joke target).
+_DAD_RE = re.compile(r"(?<![\w'’])(i['’]?m)(?![\w'’])\s+(.+)", re.IGNORECASE)
 TRENDS_DATA_PATH = Path(__file__).resolve().parent / "games" / "data" / "trends.json"
 GAME_CMD_COOLDOWN = 30  # seconds between /game uses per user
 
@@ -405,9 +411,12 @@ async def on_message(message: Message) -> None:
     # Easter egg — skip in active game threads so it doesn't interrupt gameplay.
     if message.channel.id in active_lobbies:
         return
-    content = message.content.strip().lower()
-    if content.startswith("i'm "):
-        name = message.content[4:]
+    # Trigger on "i'm" / "im" (straight or curly apostrophe) only as a
+    # standalone word — not inside "him", "image", "imma", etc. — anywhere
+    # in the message, with the rest of the message as the joke target.
+    match = _DAD_RE.search(message.content)
+    if match:
+        name = match.group(2).strip()
         pick = random.randint(1, 2)
         if pick == 1:
             await message.channel.send(f"Hi {name}, I'm Alan Tang, the goat")
