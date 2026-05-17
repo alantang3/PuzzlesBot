@@ -149,18 +149,19 @@ async def _build_pool(
 
         span = (upper - lower).total_seconds()
         anchor = lower + datetime.timedelta(seconds=random.uniform(0, span)) if span > 0 else upper
-        after_bound = lower if date_start is not None else None
 
         out: list[discord.Message] = []
+        raw = 0
         async with sem:
             try:
-                # oldest_first=False is required: passing `after` otherwise
-                # flips discord.py to oldest-first, which would ignore the
-                # random anchor and always return the same earliest messages.
-                async for msg in channel.history(
-                    limit=HISTORY_WINDOW, before=anchor,
-                    after=after_bound, oldest_first=False,
-                ):
+                # `around` (not `before`): `before=anchor` returned everything
+                # from the window start up to the anchor capped at the newest
+                # 100 — so late anchors yielded the same recent slice and early
+                # anchors yielded almost nothing ("4 repeats" / "0 results").
+                # `around` grabs ~100 messages centred on the random spot, so
+                # each marker is an independent neighbourhood → real variety.
+                async for msg in channel.history(limit=HISTORY_WINDOW, around=anchor):
+                    raw += 1
                     author = msg.author
                     if author.bot or msg.is_system():
                         continue
@@ -178,18 +179,29 @@ async def _build_pool(
                     out.append(msg)
             except (discord.Forbidden, discord.HTTPException):
                 pass
-        return out
+        return out, raw, channel.name, anchor
 
     results = await asyncio.gather(*[_read_marker() for _ in range(POOL_MARKERS)])
 
     pool: list[discord.Message] = []
     seen_ids: set[int] = set()
-    for batch in results:
-        for msg in batch:
+    marker_dbg: list[str] = []
+    for out, raw, chname, anchor in results:
+        for msg in out:
             if msg.id in seen_ids:
                 continue
             seen_ids.add(msg.id)
             pool.append(msg)
+        marker_dbg.append(f"#{chname}@{anchor:%Y-%m-%d}:raw={raw},kept={len(out)}")
+
+    win = ("all" if date_start is None else f"{date_start:%Y-%m-%d}") + ".." + (
+        "now" if date_end is None else f"{date_end:%Y-%m-%d}"
+    )
+    print(
+        f"[who_sent_the_message] readable_channels={len(channels)} "
+        f"window={win} markers=[{' | '.join(marker_dbg)}] "
+        f"unique_pool={len(pool)}"
+    )
     return pool
 
 

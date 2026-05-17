@@ -65,7 +65,11 @@ STAGES = [
 
 
 def render(word, guessed):
-    return " ".join(c if c in guessed else "_" for c in word)
+    # Non-letters (spaces, punctuation, digits) are always shown; only
+    # alphabetic characters have to be guessed. Single words are unaffected.
+    return " ".join(
+        c if (not c.isalpha() or c in guessed) else "_" for c in word
+    )
 
 
 async def start(thread, user, bot):
@@ -129,15 +133,18 @@ async def start(thread, user, bot):
 # -----------------------------------------------------------------------------
 
 MIN_WORD_LEN = 3
-MAX_WORD_LEN = 20
+# MP allows full phrases/sentences, not just single words. Deliberate cap —
+# surfaced, not silently chosen; adjust freely.
+MAX_PHRASE_LEN = 100
 
 
 MAX_CATEGORY_LEN = 40
 
 
 class _SetWordModal(discord.ui.Modal, title="Pick your word"):
-    def __init__(self):
+    def __init__(self, view: "_SetWordView"):
         super().__init__()
+        self.view_ref = view
         self.category_input = discord.ui.TextInput(
             label="Category / hint",
             min_length=2,
@@ -145,26 +152,36 @@ class _SetWordModal(discord.ui.Modal, title="Pick your word"):
             placeholder="e.g. Animals, Movies, Food...",
         )
         self.word_input = discord.ui.TextInput(
-            label=f"Word ({MIN_WORD_LEN}-{MAX_WORD_LEN} letters, no spaces)",
+            label="Word or phrase",
+            style=discord.TextStyle.paragraph,
             min_length=MIN_WORD_LEN,
-            max_length=MAX_WORD_LEN,
-            placeholder="e.g. elephant",
+            max_length=MAX_PHRASE_LEN,
+            placeholder="e.g. the quick brown fox",
         )
         self.add_item(self.category_input)
         self.add_item(self.word_input)
-        self.future: asyncio.Future = asyncio.get_event_loop().create_future()
 
     async def on_submit(self, interaction: discord.Interaction):
-        raw = self.word_input.value.strip().lower()
+        # Collapse whitespace/newlines; allow spaces & punctuation, but there
+        # must be at least one letter to actually guess.
+        raw = " ".join(self.word_input.value.split()).lower()
         category = self.category_input.value.strip()
-        if not raw.isalpha():
+        if not any(c.isalpha() for c in raw):
             await interaction.response.send_message(
-                "Letters only, no spaces or punctuation in the word.", ephemeral=True
+                "Needs at least one letter to guess.", ephemeral=True
             )
             return
-        self.future.set_result((raw, category))
+        if self.view_ref.done.is_set():
+            await interaction.response.send_message("Already set.", ephemeral=True)
+            return
+        letters = sum(1 for c in raw if c.isalpha())
+        # Result lives on the VIEW, not this modal — so a re-opened/replaced
+        # modal still resolves the same waiter the round is listening on.
+        self.view_ref.result = (raw, category)
+        self.view_ref.done.set()
+        self.view_ref.stop()
         await interaction.response.send_message(
-            f"Word locked in (**{len(raw)}** letters, category **{category}**). "
+            f"Locked in (**{letters}** letters to guess, category **{category}**). "
             f"The other player will start guessing.",
             ephemeral=True,
         )
@@ -174,7 +191,8 @@ class _SetWordView(discord.ui.View):
     def __init__(self, picker_id: int):
         super().__init__(timeout=MP_SETUP_TIMEOUT)
         self.picker_id = picker_id
-        self.modal: _SetWordModal | None = None
+        self.result: tuple[str, str] | None = None
+        self.done = asyncio.Event()
 
     @discord.ui.button(label="Set Word", style=discord.ButtonStyle.primary, emoji="✏️")
     async def set_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -183,11 +201,10 @@ class _SetWordView(discord.ui.View):
                 "👀 Only the picker can set the word — you're spectating.", ephemeral=True
             )
             return
-        if self.modal is not None and self.modal.future.done():
+        if self.done.is_set():
             await interaction.response.send_message("Already set.", ephemeral=True)
             return
-        self.modal = _SetWordModal()
-        await interaction.response.send_modal(self.modal)
+        await interaction.response.send_modal(_SetWordModal(self))
 
 
 async def _run_mp_round(thread, bot, picker, guesser) -> int:
@@ -199,22 +216,17 @@ async def _run_mp_round(thread, bot, picker, guesser) -> int:
         view=view,
     )
 
-    deadline = asyncio.get_event_loop().time() + MP_SETUP_TIMEOUT
-    result = None
-    while result is None:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            await thread.send(f"⏱ {picker.display_name} didn't pick a word. Round skipped.")
-            return MAX_WRONG + 1
-        if view.modal is not None:
-            try:
-                result = await asyncio.wait_for(view.modal.future, timeout=remaining)
-            except asyncio.TimeoutError:
-                continue
-        else:
-            await asyncio.sleep(0.5)
+    try:
+        await asyncio.wait_for(view.done.wait(), timeout=MP_SETUP_TIMEOUT)
+    except asyncio.TimeoutError:
+        await thread.send(f"⏱ {picker.display_name} didn't pick a word. Round skipped.")
+        try:
+            await setup_msg.edit(view=None)
+        except discord.HTTPException:
+            pass
+        return MAX_WRONG + 1
 
-    word, category = result
+    word, category = view.result
 
     try:
         await setup_msg.edit(view=None)
@@ -224,9 +236,11 @@ async def _run_mp_round(thread, bot, picker, guesser) -> int:
     guessed: set[str] = set()
     wrong: set[str] = set()
 
+    letters_to_guess = sum(1 for c in word if c.isalpha())
     await thread.send(
         f"Category: **{category}**\n"
-        f"Word picked: **{len(word)}** letters. **{guesser.display_name}**, type one letter at a time.\n"
+        f"**{guesser.display_name}**, guess one letter at a time — "
+        f"**{letters_to_guess}** letters (spaces & punctuation are shown).\n"
         f"```{STAGES[0]}```\nWord: `{render(word, guessed)}`"
     )
 
@@ -250,7 +264,7 @@ async def _run_mp_round(thread, bot, picker, guesser) -> int:
 
         if letter in word:
             guessed.add(letter)
-            if all(c in guessed for c in word):
+            if all(c in guessed for c in word if c.isalpha()):
                 await thread.send(
                     f"```{STAGES[len(wrong)]}```\n🎯 **{guesser.display_name}** got it with "
                     f"**{len(wrong)}** wrong {'guess' if len(wrong) == 1 else 'guesses'}! Word: **{word}**."
