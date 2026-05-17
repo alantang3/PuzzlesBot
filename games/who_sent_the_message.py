@@ -1,7 +1,6 @@
 import asyncio
 import datetime
 import random
-import re
 from zoneinfo import ZoneInfo
 
 import discord
@@ -9,7 +8,7 @@ import discord
 ROUNDS = 10
 ROUND_TIMEOUT = 45
 INTERMISSION = 2.5
-MAX_GUESSES = 2
+OPTIONS = 4  # multiple-choice buttons per round (1 correct + up to 3 decoys)
 MIN_LEN = 15
 MAX_LEN = 500
 # Sample messages from a fixed number of random "markers". Each marker is a
@@ -34,9 +33,30 @@ _DATE_SETUP_TIMEOUT = 90  # seconds the host has to pick a range before all-time
 _CMD_PREFIXES = "!/.?$;+%&>~=^*"
 
 
-def _normalize(text: str | None) -> str:
-    """Lowercase + strip non-alphanumeric, so 'Alan ✨' and 'alan' both reduce to 'alan'."""
-    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+def _option_label(member, taken: set[str]) -> str:
+    """Button label for a candidate sender, disambiguated if a name collides."""
+    base = (getattr(member, "display_name", "") or getattr(member, "name", "") or "Unknown").strip()
+    label = base[:80] or "Unknown"
+    if label.lower() in taken:
+        uname = getattr(member, "name", "") or ""
+        label = f"{base[:60]} (@{uname})"[:80]
+    return label
+
+
+def _make_options(correct, authors_by_id: dict) -> list[tuple[str, int]]:
+    """Correct sender + up to OPTIONS-1 random distinct decoys from the pool's
+    authors, shuffled. Returns [(button_label, author_id), ...] (2..OPTIONS)."""
+    decoys = [m for aid, m in authors_by_id.items() if aid != correct.id]
+    random.shuffle(decoys)
+    members = [correct] + decoys[: max(0, OPTIONS - 1)]
+    random.shuffle(members)
+    taken: set[str] = set()
+    opts: list[tuple[str, int]] = []
+    for m in members:
+        lbl = _option_label(m, taken)
+        taken.add(lbl.lower())
+        opts.append((lbl, m.id))
+    return opts
 
 
 def _looks_like_command(content: str) -> bool:
@@ -173,15 +193,6 @@ async def _build_pool(
     return pool
 
 
-def _valid_names(member: discord.Member) -> set[str]:
-    """Names the player can type to identify this member."""
-    candidates = {member.display_name, member.name}
-    global_name = getattr(member, "global_name", None)
-    if global_name:
-        candidates.add(global_name)
-    return {n for n in (_normalize(c) for c in candidates) if n}
-
-
 class _DateModal(discord.ui.Modal, title="Date range (US Central)"):
     def __init__(self, view: "_DateSetupView"):
         super().__init__()
@@ -265,6 +276,53 @@ async def _prompt_date_window(thread, host, bot):
     return view.result
 
 
+class _WSMOptionButton(discord.ui.Button):
+    def __init__(self, label: str, author_id: int, idx: int):
+        super().__init__(label=label, style=discord.ButtonStyle.primary, row=idx // 2)
+        self.author_id = author_id
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.resolve(interaction, self)
+
+
+class _WSMChoiceView(discord.ui.View):
+    def __init__(self, user_id: int, options: list[tuple[str, int]], correct_id: int):
+        super().__init__(timeout=ROUND_TIMEOUT)
+        self.user_id = user_id
+        self.correct_id = correct_id
+        self.picked_id: int | None = None
+        self.message: discord.Message | None = None
+        for idx, (label, aid) in enumerate(options):
+            self.add_item(_WSMOptionButton(label, aid, idx))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your game.", ephemeral=True)
+            return False
+        return True
+
+    async def resolve(self, interaction: discord.Interaction, btn: _WSMOptionButton):
+        self.picked_id = btn.author_id
+        for child in self.children:
+            child.disabled = True
+            if isinstance(child, _WSMOptionButton):
+                if child.author_id == self.correct_id:
+                    child.style = discord.ButtonStyle.success
+                elif child is btn:
+                    child.style = discord.ButtonStyle.danger
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
 async def start(thread, user, bot):
     guild: discord.Guild | None = getattr(thread, "guild", None)
     if guild is None:
@@ -305,46 +363,39 @@ async def start(thread, user, bot):
     await notice.edit(
         content=(
             f"**Who Sent the Message?** — {rounds_to_play} rounds. "
-            f"Type the sender's **server name** (display name or username — case and special characters don't matter). "
-            f"You get **{MAX_GUESSES}** guesses per round, **{ROUND_TIMEOUT}s** each."
+            f"Click who you think sent each message. One guess, "
+            f"**{ROUND_TIMEOUT}s** per round."
         )
     )
 
-    def is_guess(msg):
-        return (
-            msg.author.id == user.id
-            and msg.channel.id == thread.id
-            and bool(msg.content.strip())
-        )
-
     for i, msg in enumerate(chosen_messages, 1):
         correct = msg.author
-        valid = _valid_names(correct) if isinstance(correct, discord.Member) else {_normalize(correct.name)}
-        valid.discard("")
+        options = _make_options(correct, authors_by_id)
 
         content = msg.content
         if len(content) > 1000:
             content = content[:1000] + "…"
 
-        await thread.send(f"**Round {i}/{rounds_to_play}** — Who sent this?\n> {content}")
+        view = _WSMChoiceView(user.id, options, correct.id)
+        view.message = await thread.send(
+            f"**Round {i}/{rounds_to_play}** — Who sent this?\n> {content}",
+            view=view,
+        )
+        timed_out = await view.wait()
 
-        for attempt in range(1, MAX_GUESSES + 1):
-            try:
-                guess_msg = await bot.wait_for("message", check=is_guess, timeout=ROUND_TIMEOUT)
-            except asyncio.TimeoutError:
-                await thread.send(f"⏱ Out of time. It was **{correct.display_name}**. Score: **{score}/{i}**.")
-                break
-
-            if _normalize(guess_msg.content) in valid:
-                score += 1
-                await thread.send(f"✅ Correct! It was **{correct.display_name}**. Score: **{score}/{i}**.")
-                break
-
-            remaining = MAX_GUESSES - attempt
-            if remaining == 0:
-                await thread.send(f"❌ Out of guesses. It was **{correct.display_name}**. Score: **{score}/{i}**.")
-            else:
-                await thread.send(f"Not quite. **{remaining}** {'guess' if remaining == 1 else 'guesses'} left.")
+        if timed_out or view.picked_id is None:
+            await thread.send(
+                f"⏱ Out of time. It was **{correct.display_name}**. Score: **{score}/{i}**."
+            )
+        elif view.picked_id == correct.id:
+            score += 1
+            await thread.send(
+                f"✅ Correct! It was **{correct.display_name}**. Score: **{score}/{i}**."
+            )
+        else:
+            await thread.send(
+                f"❌ Wrong. It was **{correct.display_name}**. Score: **{score}/{i}**."
+            )
 
         if i < rounds_to_play:
             await asyncio.sleep(INTERMISSION)
@@ -360,62 +411,57 @@ async def start(thread, user, bot):
 MP_ROUND_TIMEOUT = 30
 
 
-class _WSMGuessModal(discord.ui.Modal, title="Who sent it?"):
-    def __init__(self, view: "_MPWSMView"):
-        super().__init__()
-        self.view_ref = view
-        self.guess = discord.ui.TextInput(label="Sender's name", max_length=64)
-        self.add_item(self.guess)
+class _MPWSMOptionButton(discord.ui.Button):
+    def __init__(self, label: str, author_id: int, idx: int):
+        super().__init__(label=label, style=discord.ButtonStyle.primary, row=idx // 2)
+        self.author_id = author_id
 
-    async def on_submit(self, interaction: discord.Interaction):
-        await self.view_ref.handle_guess(interaction, self.guess.value)
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.handle_click(interaction, self.author_id)
 
 
 class _MPWSMView(discord.ui.View):
-    def __init__(self, player_ids: set[int], valid: set[str]):
+    def __init__(self, player_ids: set[int], options: list[tuple[str, int]], correct_id: int):
         # Outlive the round so late clicks get a friendly message instead of
         # Discord's generic "interaction failed".
         super().__init__(timeout=MP_ROUND_TIMEOUT + 20)
         self.player_ids = player_ids
-        self.valid = valid
-        self.attempts: dict[int, int] = {}
+        self.correct_id = correct_id
+        self.locked_out: set[int] = set()
         self.winner_id: int | None = None
         self.finished = asyncio.Event()
         self._lock = asyncio.Lock()
+        for idx, (label, aid) in enumerate(options):
+            self.add_item(_MPWSMOptionButton(label, aid, idx))
 
-    @discord.ui.button(label="Guess", style=discord.ButtonStyle.primary, emoji="✏️")
-    async def guess_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def handle_click(self, interaction: discord.Interaction, picked_id: int):
         if interaction.user.id not in self.player_ids:
             await interaction.response.send_message("You're not in this game.", ephemeral=True)
             return
-        if self.attempts.get(interaction.user.id, 0) >= MAX_GUESSES:
-            await interaction.response.send_message("Out of guesses.", ephemeral=True)
-            return
-        if self.finished.is_set():
-            await interaction.response.send_message("Round's over.", ephemeral=True)
-            return
-        await interaction.response.send_modal(_WSMGuessModal(self))
-
-    async def handle_guess(self, interaction: discord.Interaction, raw: str):
         async with self._lock:
-            if self.finished.is_set():
-                await interaction.response.send_message("Too late.", ephemeral=True)
+            if interaction.user.id in self.locked_out:
+                await interaction.response.send_message(
+                    "You're locked out of this round.", ephemeral=True
+                )
                 return
-            if _normalize(raw) in self.valid:
+            if self.finished.is_set():
+                await interaction.response.send_message("Round's over.", ephemeral=True)
+                return
+            if picked_id == self.correct_id:
                 self.winner_id = interaction.user.id
-                await interaction.response.send_message("✅ You got it first!", ephemeral=True)
                 for child in self.children:
                     child.disabled = True
+                    if isinstance(child, _MPWSMOptionButton) and child.author_id == self.correct_id:
+                        child.style = discord.ButtonStyle.success
+                await interaction.response.edit_message(view=self)
                 self.finished.set()
-                return
-            self.attempts[interaction.user.id] = self.attempts.get(interaction.user.id, 0) + 1
-            left = MAX_GUESSES - self.attempts[interaction.user.id]
-            if left <= 0:
-                await interaction.response.send_message("❌ Out of guesses.", ephemeral=True)
             else:
+                self.locked_out.add(interaction.user.id)
                 await interaction.response.send_message(
-                    f"❌ Wrong — **{left}** {'guess' if left == 1 else 'guesses'} left.", ephemeral=True
+                    "❌ Wrong — you're out for this round.", ephemeral=True
                 )
+                if self.locked_out >= self.player_ids:
+                    self.finished.set()
 
 
 async def start_multi(thread, players, bot):
@@ -452,16 +498,16 @@ async def start_multi(thread, players, bot):
     await notice.edit(
         content=(
             f"**Who Sent the Message? — MP Race**\n"
-            f"{rounds_to_play} rounds. Click **Guess** and type the sender's name. "
-            f"First correct wins. **{MAX_GUESSES}** guesses each, **{MP_ROUND_TIMEOUT}s** per round.\nPlayers: {names}"
+            f"{rounds_to_play} rounds. Click who sent each message — first correct "
+            f"wins the round. A wrong click locks you out for that round. "
+            f"**{MP_ROUND_TIMEOUT}s** per round.\nPlayers: {names}"
         )
     )
 
     for i, msg in enumerate(chosen_messages, 1):
         try:
             correct = msg.author
-            valid = _valid_names(correct) if isinstance(correct, discord.Member) else {_normalize(correct.name)}
-            valid.discard("")
+            options = _make_options(correct, authors_by_id)
 
             content = msg.content
             if len(content) > 1000:
@@ -470,7 +516,7 @@ async def start_multi(thread, players, bot):
             scoreboard = " | ".join(
                 f"{players_by_id[pid].display_name}: **{scores[pid]}**" for pid in player_ids
             )
-            view = _MPWSMView(player_ids, valid)
+            view = _MPWSMView(player_ids, options, correct.id)
             await thread.send(
                 f"**Round {i}/{rounds_to_play}** — {scoreboard}\n> {content}",
                 view=view,
