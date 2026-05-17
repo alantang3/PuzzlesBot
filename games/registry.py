@@ -7,6 +7,7 @@ from games import (
     minesweeper,
     rock_paper_scissors,
     sports_trivia,
+    sudoku,
     who_sent_the_message,
     whos_that_pokemon,
     word_impostor,
@@ -34,6 +35,7 @@ GAMES: dict[str, dict] = {
     "Who Sent the Message?": {"single": who_sent_the_message.start, "multi": _mp(who_sent_the_message)},
     "Minesweeper": {"single": minesweeper.start, "multi": None},  # MP coming later
     "Word Impostor": {"single": word_impostor.start, "multi": word_impostor.start_multi},  # MP only
+    "Sudoku": {"single": sudoku.start, "multi": sudoku.start_multi},  # solo or race
 }
 
 
