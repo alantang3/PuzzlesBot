@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import random
 import re
+from zoneinfo import ZoneInfo
 
 import discord
 
@@ -22,18 +23,84 @@ READ_CONCURRENCY = 8   # max history reads in flight at once
 # exactly one answer every round, which isn't a game. 2 is the true minimum.
 MIN_AUTHORS = 2
 
+# Date range is chosen at game start via a modal (M/D/YY, no leading zeros)
+# and interpreted in US Central time (DST handled by the IANA zone).
+_CENTRAL = ZoneInfo("America/Chicago")
+_DATE_SETUP_TIMEOUT = 90  # seconds the host has to pick a range before all-time
+
+# Treat a message as a (any-bot) command if it starts with one of these and
+# the next char is a letter — so "!start", ".play", "?help", "$ping", ">say"
+# are dropped, but "-5 degrees", "$20", "... hmm" are kept.
+_CMD_PREFIXES = "!/.?$;+%&>~=^*"
+
 
 def _normalize(text: str | None) -> str:
     """Lowercase + strip non-alphanumeric, so 'Alan ✨' and 'alan' both reduce to 'alan'."""
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())
 
 
-async def _build_pool(guild: discord.Guild, exclude_channel_ids: set[int]) -> list[discord.Message]:
+def _looks_like_command(content: str) -> bool:
+    return len(content) >= 2 and content[0] in _CMD_PREFIXES and content[1].isalpha()
+
+
+def _is_deleted_user(author) -> bool:
+    """Discord has no official 'deleted' flag; deleted accounts are renamed to
+    the 'deleted_user_<id>' / 'Deleted User' pattern, which is what we match."""
+    name = (getattr(author, "name", "") or "").lower()
+    disp = (getattr(author, "display_name", "") or "").lower()
+    return (
+        name.startswith("deleted_user")
+        or name.startswith("deleted user")
+        or disp == "deleted user"
+    )
+
+
+def _parse_mdy(raw: str) -> tuple[int, int, int]:
+    """'M/D/YY' (no leading zeros required) -> (year, month, day)."""
+    parts = raw.strip().split("/")
+    if len(parts) != 3:
+        raise ValueError(f"`{raw}` isn't M/D/YY — e.g. `5/16/26`.")
+    try:
+        m, d, yy = (int(p) for p in parts)
+    except ValueError:
+        raise ValueError(f"`{raw}` isn't M/D/YY — e.g. `5/16/26`.")
+    year = yy if yy >= 1000 else 2000 + yy
+    return year, m, d
+
+
+def _day_start_ct(raw: str) -> datetime.datetime:
+    y, m, d = _parse_mdy(raw)
+    try:
+        local = datetime.datetime(y, m, d, 0, 0, 0, tzinfo=_CENTRAL)
+    except ValueError:
+        raise ValueError(f"`{raw}` isn't a real date.")
+    return local.astimezone(datetime.timezone.utc)
+
+
+def _day_end_ct(raw: str) -> datetime.datetime:
+    y, m, d = _parse_mdy(raw)
+    try:
+        local = datetime.datetime(y, m, d, 23, 59, 59, 999999, tzinfo=_CENTRAL)
+    except ValueError:
+        raise ValueError(f"`{raw}` isn't a real date.")
+    return local.astimezone(datetime.timezone.utc)
+
+
+async def _build_pool(
+    guild: discord.Guild,
+    exclude_channel_ids: set[int],
+    date_start: datetime.datetime | None = None,
+    date_end: datetime.datetime | None = None,
+) -> list[discord.Message]:
     """Collect eligible messages from POOL_MARKERS random markers. Each marker
     is a random readable channel at a random point in its history, read for up
     to HISTORY_WINDOW messages (fewer is fine — short/sparse spots just
     contribute less). Total cost is the marker count, independent of how many
-    channels the server has, while staying random across channels and time."""
+    channels the server has, while staying random across channels and time.
+
+    date_start/date_end (tz-aware UTC, or None) scope eligible messages to a
+    window; passed per game rather than global so concurrent games on
+    different servers can't clobber each other's range."""
     now = discord.utils.utcnow()
 
     channels: list[discord.TextChannel] = []
@@ -50,21 +117,43 @@ async def _build_pool(guild: discord.Guild, exclude_channel_ids: set[int]) -> li
 
     async def _read_marker() -> list[discord.Message]:
         channel = random.choice(channels)
-        created = channel.created_at or now
-        span = (now - created).total_seconds()
-        before: datetime.datetime | None = None
-        if span > 0:
-            before = created + datetime.timedelta(seconds=random.uniform(0, span))
+        # Window = overlap of [channel lifetime] and [configured date range].
+        lower = channel.created_at or now
+        upper = now
+        if date_start is not None:
+            lower = max(lower, date_start)
+        if date_end is not None:
+            upper = min(upper, date_end)
+        if lower >= upper:
+            return []  # channel has nothing in the configured window
+
+        span = (upper - lower).total_seconds()
+        anchor = lower + datetime.timedelta(seconds=random.uniform(0, span)) if span > 0 else upper
+        after_bound = lower if date_start is not None else None
+
         out: list[discord.Message] = []
         async with sem:
             try:
-                async for msg in channel.history(limit=HISTORY_WINDOW, before=before):
-                    if msg.author.bot or msg.is_system():
+                # oldest_first=False is required: passing `after` otherwise
+                # flips discord.py to oldest-first, which would ignore the
+                # random anchor and always return the same earliest messages.
+                async for msg in channel.history(
+                    limit=HISTORY_WINDOW, before=anchor,
+                    after=after_bound, oldest_first=False,
+                ):
+                    author = msg.author
+                    if author.bot or msg.is_system():
+                        continue
+                    if _is_deleted_user(author):
+                        continue
+                    if date_start is not None and msg.created_at < date_start:
+                        continue
+                    if date_end is not None and msg.created_at > date_end:
                         continue
                     content = (msg.content or "").strip()
                     if not (MIN_LEN <= len(content) <= MAX_LEN):
                         continue
-                    if content.startswith(("http://", "https://", "/", "!")):
+                    if content.startswith(("http://", "https://")) or _looks_like_command(content):
                         continue
                     out.append(msg)
             except (discord.Forbidden, discord.HTTPException):
@@ -93,14 +182,101 @@ def _valid_names(member: discord.Member) -> set[str]:
     return {n for n in (_normalize(c) for c in candidates) if n}
 
 
+class _DateModal(discord.ui.Modal, title="Date range (US Central)"):
+    def __init__(self, view: "_DateSetupView"):
+        super().__init__()
+        self.view_ref = view
+        self.start_in = discord.ui.TextInput(
+            label="Start date  (M/D/YY)", placeholder="e.g. 1/1/25", max_length=10
+        )
+        self.end_in = discord.ui.TextInput(
+            label="End date  (M/D/YY)", placeholder="e.g. 5/16/26", max_length=10
+        )
+        self.add_item(self.start_in)
+        self.add_item(self.end_in)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            start = _day_start_ct(self.start_in.value)
+            end = _day_end_ct(self.end_in.value)
+        except ValueError as e:
+            await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+            return
+        if start > end:
+            await interaction.response.send_message(
+                "⚠️ Start date is after end date.", ephemeral=True
+            )
+            return
+        self.view_ref.result = (start, end)
+        await interaction.response.send_message(
+            f"📅 Range set: **{self.start_in.value} → {self.end_in.value}** (Central).",
+            ephemeral=True,
+        )
+        self.view_ref.done.set()
+        self.view_ref.stop()
+
+
+class _DateSetupView(discord.ui.View):
+    def __init__(self, host_id: int):
+        super().__init__(timeout=_DATE_SETUP_TIMEOUT)
+        self.host_id = host_id
+        self.result: tuple[datetime.datetime | None, datetime.datetime | None] = (None, None)
+        self.done = asyncio.Event()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.host_id:
+            await interaction.response.send_message(
+                "Only the host picks the date range.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Set Date Range", style=discord.ButtonStyle.primary, emoji="📅")
+    async def set_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_modal(_DateModal(self))
+
+    @discord.ui.button(label="All Time", style=discord.ButtonStyle.secondary, emoji="♾️")
+    async def all_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.result = (None, None)
+        await interaction.response.send_message(
+            "♾️ Using **all-time** history.", ephemeral=True
+        )
+        self.done.set()
+        self.stop()
+
+
+async def _prompt_date_window(thread, host, bot):
+    """Ask the host for a date range. Returns (start, end) tz-aware UTC, or
+    (None, None) for all-time / no choice made in time."""
+    view = _DateSetupView(host.id)
+    msg = await thread.send(
+        f"**{host.display_name}**, choose the message **date range** (US Central, "
+        f"**M/D/YY**, no leading zeros — e.g. `5/16/26`), or use the whole history.",
+        view=view,
+    )
+    try:
+        await asyncio.wait_for(view.done.wait(), timeout=_DATE_SETUP_TIMEOUT + 5)
+    except asyncio.TimeoutError:
+        pass
+    try:
+        await msg.edit(view=None)
+    except discord.HTTPException:
+        pass
+    return view.result
+
+
 async def start(thread, user, bot):
     guild: discord.Guild | None = getattr(thread, "guild", None)
     if guild is None:
         await thread.send("This game needs to be played inside a server.")
         return
 
-    notice = await thread.send("Collecting recent server messages…")
-    pool = await _build_pool(guild, exclude_channel_ids={thread.id})
+    date_start, date_end = await _prompt_date_window(thread, user, bot)
+    notice = await thread.send("Collecting server messages…")
+    pool = await _build_pool(
+        guild, exclude_channel_ids={thread.id},
+        date_start=date_start, date_end=date_end,
+    )
 
     if not pool:
         await notice.edit(
@@ -248,8 +424,12 @@ async def start_multi(thread, players, bot):
         await thread.send("Needs to be played in a server.")
         return
 
-    notice = await thread.send("Collecting recent server messages…")
-    pool = await _build_pool(guild, exclude_channel_ids={thread.id})
+    date_start, date_end = await _prompt_date_window(thread, players[0], bot)
+    notice = await thread.send("Collecting server messages…")
+    pool = await _build_pool(
+        guild, exclude_channel_ids={thread.id},
+        date_start=date_start, date_end=date_end,
+    )
     if not pool:
         await notice.edit(content="No eligible messages found.")
         return
