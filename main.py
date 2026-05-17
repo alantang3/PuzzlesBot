@@ -98,6 +98,7 @@ class GameSelect(Select):
             discord.SelectOption(label="Who's That Pokemon?", description="Guess the Pokemon."),
             discord.SelectOption(label="Who Sent the Message?", description="Guess the message sender."),
             discord.SelectOption(label="Minesweeper", description="Classic minesweeper, 9x9 with 10 mines."),
+            discord.SelectOption(label="Word Impostor", description="Multiplayer: find the impostor with the different word."),
         ]
         super().__init__(
             placeholder="Choose a game to play...",

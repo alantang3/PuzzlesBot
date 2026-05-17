@@ -9,6 +9,7 @@ from games import (
     sports_trivia,
     who_sent_the_message,
     whos_that_pokemon,
+    word_impostor,
     wordle,
 )
 
@@ -32,6 +33,7 @@ GAMES: dict[str, dict] = {
     "Who's That Pokemon?": {"single": whos_that_pokemon.start, "multi": _mp(whos_that_pokemon)},
     "Who Sent the Message?": {"single": who_sent_the_message.start, "multi": _mp(who_sent_the_message)},
     "Minesweeper": {"single": minesweeper.start, "multi": None},  # MP coming later
+    "Word Impostor": {"single": word_impostor.start, "multi": word_impostor.start_multi},  # MP only
 }
 
 
